@@ -2,6 +2,8 @@
 #include "Dxgi_Spoofing.h"
 
 #include <Config.h>
+#include <Util.h>
+#include <proxies/Dxgi_Proxy.h>
 
 #include <detours/detours.h>
 
@@ -27,6 +29,41 @@ inline static std::string toLower(std::string s)
 
 inline static bool iequals(const std::string& a, const std::string& b) { return toLower(a) == toLower(b); }
 
+// Skip spoof only for real system DXGI (HMODULE), not because Opti is named dxgi.dll.
+// Also skip known driver stacks by filename. Do NOT skip solely on filename dxgi/d3d12/d3d12Core
+// (breaks Opti-as-dxgi and Wine/D3DMetal GetDesc paths used by Streamline/Witcher 3).
+inline static bool ShouldSkipCallerSpoof(void* returnAddress)
+{
+    const HMODULE callerMod = Util::GetCallerModule(returnAddress);
+    const auto caller = Util::WhoIsTheCaller(returnAddress);
+
+    if (iequals(caller, "fakenvapi.dll") || iequals(caller, "vulkan-1.dll") || iequals(caller, "amdvlk64.dll"))
+        return true;
+
+    // Opti itself may be loaded as dxgi.dll — never treat our module as system DXGI.
+    if (callerMod != nullptr && callerMod == dllModule)
+        return false;
+
+    // Ensure real system DXGI is resolved (dllmain usually already did this).
+    if (DxgiProxy::Module() == nullptr)
+        DxgiProxy::Init();
+
+    const HMODULE realDxgi = DxgiProxy::Module();
+    if (realDxgi != nullptr && callerMod == realDxgi)
+        return true;
+
+    // Optional: real system d3d12 HMODULE only (not filename). Disabled by default for
+    // Wine/CrossOver where d3d12 GetDesc callers must still see the spoof for DLSS unlock.
+    // Uncomment if CreateDevice still sees AMD and driver stability requires it:
+    // if (D3d12Proxy::Module() == nullptr)
+    //     D3d12Proxy::Init();
+    // const HMODULE realD3d12 = D3d12Proxy::Module();
+    // if (realD3d12 != nullptr && callerMod == realD3d12)
+    //     return true;
+
+    return false;
+}
+
 #pragma region DXGI Adapter methods
 
 inline static bool SkipSpoofing()
@@ -48,8 +85,7 @@ HRESULT DxgiSpoofing::hkGetDesc3(IDXGIAdapter4* This, DXGI_ADAPTER_DESC3* pDesc)
 
     auto caller = Util::WhoIsTheCaller(_ReturnAddress());
 
-    if (iequals(caller, "fakenvapi.dll") || iequals(caller, "vulkan-1.dll") || iequals(caller, "amdvlk64.dll") ||
-        iequals(caller, "dxgi.dll") || iequals(caller, "d3d12.dll") || iequals(caller, "d3d12Core.dll"))
+    if (ShouldSkipCallerSpoof(_ReturnAddress()))
     {
         return result;
     }
@@ -109,8 +145,7 @@ HRESULT DxgiSpoofing::hkGetDesc2(IDXGIAdapter2* This, DXGI_ADAPTER_DESC2* pDesc)
 
     auto caller = Util::WhoIsTheCaller(_ReturnAddress());
 
-    if (iequals(caller, "fakenvapi.dll") || iequals(caller, "vulkan-1.dll") || iequals(caller, "amdvlk64.dll") ||
-        iequals(caller, "dxgi.dll") || iequals(caller, "d3d12.dll") || iequals(caller, "d3d12Core.dll"))
+    if (ShouldSkipCallerSpoof(_ReturnAddress()))
     {
         return result;
     }
@@ -170,8 +205,7 @@ HRESULT DxgiSpoofing::hkGetDesc1(IDXGIAdapter1* This, DXGI_ADAPTER_DESC1* pDesc)
 
     auto caller = Util::WhoIsTheCaller(_ReturnAddress());
 
-    if (iequals(caller, "fakenvapi.dll") || iequals(caller, "vulkan-1.dll") || iequals(caller, "amdvlk64.dll") ||
-        iequals(caller, "dxgi.dll") || iequals(caller, "d3d12.dll") || iequals(caller, "d3d12Core.dll"))
+    if (ShouldSkipCallerSpoof(_ReturnAddress()))
     {
         return result;
     }
@@ -231,8 +265,7 @@ HRESULT DxgiSpoofing::hkGetDesc(IDXGIAdapter* This, DXGI_ADAPTER_DESC* pDesc)
 
     auto caller = Util::WhoIsTheCaller(_ReturnAddress());
 
-    if (iequals(caller, "fakenvapi.dll") || iequals(caller, "vulkan-1.dll") || iequals(caller, "amdvlk64.dll") ||
-        iequals(caller, "dxgi.dll") || iequals(caller, "d3d12.dll") || iequals(caller, "d3d12Core.dll"))
+    if (ShouldSkipCallerSpoof(_ReturnAddress()))
     {
         return result;
     }
