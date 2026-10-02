@@ -68,15 +68,17 @@ inline static bool ShouldSkipCallerSpoof(void* returnAddress)
 
 inline static bool SkipSpoofing()
 {
-    auto skip = !Config::Instance()->DxgiSpoofing.value_or_default() || State::Instance().skipSpoofing;
+    // When Dxgi spoofing is enabled, ALWAYS spoof — ignore State::skipSpoofing.
+    // ScopedSkipSpoofing around CreateDevice/CheckForGPU left AMD VendorId visible to
+    // Streamline/game on Wine/CrossOver (Witcher 3), blocking DLSS unlock.
+    // Callers that need the unsponsored adapter use DxgiSpoofing::GetRealAdapterDesc().
+    const bool dxgiOn = Config::Instance()->DxgiSpoofing.value_or_default();
+    if (dxgiOn)
+        return false;
 
-    if (skip)
-    {
-        LOG_TRACE("DxgiSpoofing: {}, skipSpoofing: {}, skipping spoofing",
-                  Config::Instance()->DxgiSpoofing.value_or_default(), State::Instance().skipSpoofing);
-    }
-
-    return skip;
+    LOG_TRACE("DxgiSpoofing: {}, skipSpoofing: {}, skipping spoofing", dxgiOn,
+              State::Instance().skipSpoofing);
+    return true;
 }
 
 HRESULT DxgiSpoofing::hkGetDesc3(IDXGIAdapter4* This, DXGI_ADAPTER_DESC3* pDesc)
@@ -317,6 +319,22 @@ HRESULT DxgiSpoofing::hkGetDesc(IDXGIAdapter* This, DXGI_ADAPTER_DESC* pDesc)
     AttachToAdapter(This);
 
     return result;
+}
+
+#pragma endregion
+
+#pragma region DXGI real (unspoofed) desc
+
+HRESULT DxgiSpoofing::GetRealAdapterDesc(IDXGIAdapter* adapter, DXGI_ADAPTER_DESC* pDesc)
+{
+    if (adapter == nullptr || pDesc == nullptr)
+        return E_POINTER;
+
+    // Bypass hkGetDesc so ScopedSkip / Dxgi spoofing cannot alter the result.
+    if (o_GetDesc != nullptr)
+        return o_GetDesc(adapter, pDesc);
+
+    return adapter->GetDesc(pDesc);
 }
 
 #pragma endregion

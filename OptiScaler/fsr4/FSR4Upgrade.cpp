@@ -2,6 +2,7 @@
 #include "FSR4Upgrade.h"
 
 #include <proxies/Dxgi_Proxy.h>
+#include <spoofing/Dxgi_Spoofing.h>
 #include <detours/detours.h>
 #include <scanner/scanner.h>
 #include <ffx_framegeneration.h>
@@ -161,8 +162,9 @@ void CheckForGPU()
         }
 
         {
-            ScopedSkipSpoofing skipSpoofing {};
-            result = adapter->GetDesc(&adapterDesc);
+            // Real adapter (RDNA detect). Do not ScopedSkip — with Dxgi spoofing on that
+            // flag suppressed ALL GetDesc spoofing and broke DLSS unlock on Wine.
+            result = DxgiSpoofing::GetRealAdapterDesc(adapter, &adapterDesc);
         }
 
         if (result == S_OK && adapterDesc.VendorId != VendorId::Microsoft)

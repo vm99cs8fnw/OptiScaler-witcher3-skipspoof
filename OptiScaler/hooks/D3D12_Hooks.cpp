@@ -20,6 +20,8 @@
 
 #include "Hook_Utils.h"
 
+#include <spoofing/Dxgi_Spoofing.h>
+
 #pragma intrinsic(_ReturnAddress)
 
 using PFN_CheckFeatureSupport = rewrite_signature<decltype(&ID3D12Device::CheckFeatureSupport)>::type;
@@ -1351,9 +1353,26 @@ static HRESULT hkD3D12CreateDevice(IUnknown* pAdapter, D3D_FEATURE_LEVEL Minimum
     std::wstring szName;
     if (pAdapter != nullptr && MinimumFeatureLevel != D3D_FEATURE_LEVEL_1_0_CORE)
     {
-        ScopedSkipSpoofing skipSpoofing {};
-
-        if (((IDXGIAdapter*) pAdapter)->GetDesc(&desc) == S_OK)
+        // Real vendor for Intel atomics (bypass hook). When Dxgi spoofing is on, also
+        // capture spoofed desc for logs/DeviceAdapterNames — do NOT ScopedSkip globally
+        // (that left AMD VendorId visible to Streamline on Wine/CrossOver).
+        const bool gotReal = DxgiSpoofing::GetRealAdapterDesc((IDXGIAdapter*) pAdapter, &desc) == S_OK;
+        if (Config::Instance()->DxgiSpoofing.value_or_default())
+        {
+            DXGI_ADAPTER_DESC spoofed {};
+            if (((IDXGIAdapter*) pAdapter)->GetDesc(&spoofed) == S_OK)
+            {
+                szName = spoofed.Description;
+                LOG_INFO("Adapter Desc: {} (real VendorId {:#x})", wstring_to_string(szName),
+                         gotReal ? desc.VendorId : 0u);
+            }
+            else if (gotReal)
+            {
+                szName = desc.Description;
+                LOG_INFO("Adapter Desc: {}", wstring_to_string(szName));
+            }
+        }
+        else if (gotReal)
         {
             szName = desc.Description;
             LOG_INFO("Adapter Desc: {}", wstring_to_string(szName));
@@ -1486,9 +1505,26 @@ static HRESULT hkCreateDevice(ID3D12DeviceFactory* pFactory, IUnknown* pAdapter,
     std::wstring szName;
     if (pAdapter != nullptr && MinimumFeatureLevel != D3D_FEATURE_LEVEL_1_0_CORE)
     {
-        ScopedSkipSpoofing skipSpoofing {};
-
-        if (((IDXGIAdapter*) pAdapter)->GetDesc(&desc) == S_OK)
+        // Real vendor for Intel atomics (bypass hook). When Dxgi spoofing is on, also
+        // capture spoofed desc for logs/DeviceAdapterNames — do NOT ScopedSkip globally
+        // (that left AMD VendorId visible to Streamline on Wine/CrossOver).
+        const bool gotReal = DxgiSpoofing::GetRealAdapterDesc((IDXGIAdapter*) pAdapter, &desc) == S_OK;
+        if (Config::Instance()->DxgiSpoofing.value_or_default())
+        {
+            DXGI_ADAPTER_DESC spoofed {};
+            if (((IDXGIAdapter*) pAdapter)->GetDesc(&spoofed) == S_OK)
+            {
+                szName = spoofed.Description;
+                LOG_INFO("Adapter Desc: {} (real VendorId {:#x})", wstring_to_string(szName),
+                         gotReal ? desc.VendorId : 0u);
+            }
+            else if (gotReal)
+            {
+                szName = desc.Description;
+                LOG_INFO("Adapter Desc: {}", wstring_to_string(szName));
+            }
+        }
+        else if (gotReal)
         {
             szName = desc.Description;
             LOG_INFO("Adapter Desc: {}", wstring_to_string(szName));

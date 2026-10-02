@@ -8,6 +8,8 @@ class DxgiSpoofing
 {
   public:
     static void AttachToAdapter(IUnknown* unkAdapter);
+    // Unspoofed GetDesc via original vtable hook (for Intel/RDNA detect).
+    static HRESULT GetRealAdapterDesc(IDXGIAdapter* adapter, DXGI_ADAPTER_DESC* pDesc);
 
   private:
     static HRESULT hkGetDesc(IDXGIAdapter* This, DXGI_ADAPTER_DESC* pDesc);
