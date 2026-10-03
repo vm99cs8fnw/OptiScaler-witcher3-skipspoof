@@ -673,31 +673,125 @@ bool StreamlineHooks::hkdlss_slOnPluginLoad(sl::param::IParameters* params, cons
     return result;
 }
 
+static uint32_t MetalFxEvenRenderSize(uint32_t output, uint32_t mul, uint32_t div)
+{
+    if (div == 0)
+        return 0;
+    uint32_t size = (output * mul + div / 2) / div;
+    if (size > 1)
+        size &= ~1u;
+    if (size < 2)
+        size = 2;
+    return size;
+}
+
+// NVIDIA scale factors. MaxQuality (Witcher DLSSQuality=3) is 1.5x, so render is 2/3.
+static bool MetalFxFillOptimalSettings(const sl::DLSSOptions& options, sl::DLSSOptimalSettings& settings)
+{
+    uint32_t mul = 0;
+    uint32_t div = 1;
+    switch (options.mode)
+    {
+    case sl::DLSSMode::eMaxQuality: // 2/3
+        mul = 2;
+        div = 3;
+        break;
+    case sl::DLSSMode::eBalanced: // ~0.58
+        mul = 58;
+        div = 100;
+        break;
+    case sl::DLSSMode::eMaxPerformance: // 1/2
+        mul = 1;
+        div = 2;
+        break;
+    case sl::DLSSMode::eUltraPerformance: // 1/3
+        mul = 1;
+        div = 3;
+        break;
+    case sl::DLSSMode::eUltraQuality: // ~0.77
+        mul = 77;
+        div = 100;
+        break;
+    case sl::DLSSMode::eDLAA:
+        mul = 1;
+        div = 1;
+        break;
+    default:
+        return false;
+    }
+
+    if (options.outputWidth == 0 || options.outputHeight == 0 || options.outputWidth == 0xFFFFFFFFu ||
+        options.outputHeight == 0xFFFFFFFFu)
+        return false;
+
+    uint32_t w = MetalFxEvenRenderSize(options.outputWidth, mul, div);
+    uint32_t h = MetalFxEvenRenderSize(options.outputHeight, mul, div);
+    settings.optimalRenderWidth = w;
+    settings.optimalRenderHeight = h;
+    settings.renderWidthMin = w;
+    settings.renderHeightMin = h;
+    settings.renderWidthMax = w;
+    settings.renderHeightMax = h;
+    return true;
+}
+
 sl::Result StreamlineHooks::hkslDLSSGetOptimalSettings(const sl::DLSSOptions& options,
                                                        sl::DLSSOptimalSettings& settings)
 {
     static bool modesBroken = false;
+    static int logged = 0;
+    const bool logThis = logged < 12;
+    if (logThis)
+        logged++;
 
     auto localOptions = options;
 
-    if (localOptions.mode == sl::DLSSMode::eOff)
-        modesBroken = true;
-
-    if (modesBroken)
+    // Pregmata ships modes shifted by one. Do not apply that to Witcher.
+    if (State::Instance().gameQuirks & GameQuirk::PregmataFixDLSSModes)
     {
-        if (localOptions.mode == sl::DLSSMode::eMaxPerformance)
-            localOptions.mode = sl::DLSSMode::eUltraPerformance;
-        else if (localOptions.mode == sl::DLSSMode::eBalanced)
-            localOptions.mode = sl::DLSSMode::eMaxPerformance;
-        else if (localOptions.mode == sl::DLSSMode::eMaxQuality)
-            localOptions.mode = sl::DLSSMode::eBalanced;
-        else if (localOptions.mode == sl::DLSSMode::eUltraQuality)
-            localOptions.mode = sl::DLSSMode::eMaxQuality;
-        else if (localOptions.mode == sl::DLSSMode::eUltraPerformance)
-            localOptions.mode = sl::DLSSMode::eDLAA;
+        if (localOptions.mode == sl::DLSSMode::eOff)
+            modesBroken = true;
+
+        if (modesBroken)
+        {
+            if (localOptions.mode == sl::DLSSMode::eMaxPerformance)
+                localOptions.mode = sl::DLSSMode::eUltraPerformance;
+            else if (localOptions.mode == sl::DLSSMode::eBalanced)
+                localOptions.mode = sl::DLSSMode::eMaxPerformance;
+            else if (localOptions.mode == sl::DLSSMode::eMaxQuality)
+                localOptions.mode = sl::DLSSMode::eBalanced;
+            else if (localOptions.mode == sl::DLSSMode::eUltraQuality)
+                localOptions.mode = sl::DLSSMode::eMaxQuality;
+            else if (localOptions.mode == sl::DLSSMode::eUltraPerformance)
+                localOptions.mode = sl::DLSSMode::eDLAA;
+        }
     }
 
-    return o_slDLSSGetOptimalSettings(localOptions, settings);
+    if (logThis)
+        LOG_INFO("MetalFX slDLSSGetOptimalSettings entry mode {0} out {1}x{2}", (uint32_t) options.mode,
+                 options.outputWidth, options.outputHeight);
+
+    sl::Result result = sl::Result::eErrorMissingOrInvalidAPI;
+    settings.optimalRenderWidth = 0;
+    settings.optimalRenderHeight = 0;
+    if (o_slDLSSGetOptimalSettings != nullptr)
+        result = o_slDLSSGetOptimalSettings(localOptions, settings);
+
+    const uint32_t realW = settings.optimalRenderWidth;
+    const uint32_t realH = settings.optimalRenderHeight;
+    const bool empty = realW == 0 || realH == 0;
+    if ((result != sl::Result::eOk || empty) && MetalFxFillOptimalSettings(options, settings))
+    {
+        LOG_INFO("MetalFX slDLSSGetOptimalSettings real result {0} size {1}x{2}; using ratio for mode {3} -> {4}x{5}",
+                 (int) result, realW, realH, (uint32_t) options.mode, settings.optimalRenderWidth,
+                 settings.optimalRenderHeight);
+        return sl::Result::eOk;
+    }
+
+    if (logThis || result != sl::Result::eOk)
+        LOG_INFO("MetalFX slDLSSGetOptimalSettings result {0} optimal {1}x{2}", (int) result,
+                 settings.optimalRenderWidth, settings.optimalRenderHeight);
+    return result;
 }
 
 bool StreamlineHooks::hkdlssg_slOnPluginLoad(sl::param::IParameters* params, const char* loaderJSON,
@@ -952,11 +1046,15 @@ void* StreamlineHooks::hkdlss_slGetPluginFunction(const char* functionName)
         return &hkdlss_slOnPluginLoad;
     }
 
-    if (strcmp(functionName, "slDLSSGetOptimalSettings") == 0 &&
-        State::Instance().gameQuirks & GameQuirk::PregmataFixDLSSModes)
+    if (strcmp(functionName, "slDLSSGetOptimalSettings") == 0)
     {
-        o_slDLSSGetOptimalSettings = (decltype(&slDLSSGetOptimalSettings)) o_dlss_slGetPluginFunction(functionName);
-        return &hkslDLSSGetOptimalSettings;
+        auto real = (decltype(&slDLSSGetOptimalSettings)) o_dlss_slGetPluginFunction(functionName);
+        o_slDLSSGetOptimalSettings = real;
+        if (real == nullptr)
+            LOG_WARN("MetalFX: sl.dlss slDLSSGetOptimalSettings is null; wrapper will synthesize a render size");
+        else
+            LOG_INFO("MetalFX: installed slDLSSGetOptimalSettings wrapper at {0:X}", (uint64_t) real);
+        return (void*) &hkslDLSSGetOptimalSettings;
     }
 
     if (strcmp(functionName, "slDLSSSetOptions") == 0)
