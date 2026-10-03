@@ -49,7 +49,6 @@ class ScopedInitDx12
 static bool NgxPassthrough() { return Config::Instance()->NgxDlssPassthrough(); }
 
 static thread_local int g_realNvngxCreateDepth = 0;
-static thread_local int g_realNvngxEvalDepth = 0;
 
 // Call CrossOver system32 nvngx (MetalFX) on this thread and return its result.
 // No FSR feature, no worker thread: a command list is not free-threaded, and a
@@ -102,91 +101,6 @@ static NVSDK_NGX_Result CallMetalFxCreateFeature(ID3D12GraphicsCommandList* InCm
              (UINT64) (uintptr_t) (OutHandle != nullptr ? *OutHandle : nullptr));
     return result;
 }
-
-static NVSDK_NGX_Result Hooked_Real_D3D12_CreateFeature(ID3D12GraphicsCommandList* InCmdList,
-                                                                  NVSDK_NGX_Feature InFeatureID,
-                                                                  NVSDK_NGX_Parameter* InParameters,
-                                                                  NVSDK_NGX_Handle** OutHandle)
-{
-    return CallMetalFxCreateFeature(InCmdList, InFeatureID, InParameters, OutHandle);
-}
-
-static NVSDK_NGX_Result Hooked_Real_D3D12_EvaluateFeature(ID3D12GraphicsCommandList* InCmdList,
-                                                                    const NVSDK_NGX_Handle* InFeatureHandle,
-                                                                    const NVSDK_NGX_Parameter* InParameters,
-                                                                    PFN_NVSDK_NGX_ProgressCallback InCallback)
-{
-    if (g_realNvngxEvalDepth > 0)
-    {
-        auto original = NVNGXProxy::D3D12_EvaluateFeatureRaw();
-        if (original == nullptr)
-            return NVSDK_NGX_Result_FAIL_FeatureNotFound;
-        return original(InCmdList, InFeatureHandle, InParameters, InCallback);
-    }
-
-    const unsigned int handleId = InFeatureHandle != nullptr ? InFeatureHandle->Id : 0;
-    static int evalLogs = 0;
-    if (evalLogs < 8)
-    {
-        LOG_INFO("MetalFX D3D12_EvaluateFeature entry id {0}", handleId);
-        evalLogs++;
-    }
-    else
-    {
-        LOG_DEBUG("MetalFX D3D12_EvaluateFeature entry id {0}", handleId);
-    }
-
-    // Opti-created handles (not used on the MetalFX passthrough path).
-    if (InFeatureHandle != nullptr && handleId >= DLSS_MOD_ID_OFFSET)
-        return NVSDK_NGX_D3D12_EvaluateFeature(InCmdList, InFeatureHandle, const_cast<NVSDK_NGX_Parameter*>(InParameters),
-                                               InCallback);
-
-    auto original = NVNGXProxy::D3D12_EvaluateFeatureRaw();
-    if (original == nullptr)
-    {
-        LOG_ERROR("MetalFX D3D12_EvaluateFeature export missing id {0}", handleId);
-        return NVSDK_NGX_Result_FAIL_FeatureNotFound;
-    }
-
-    g_realNvngxEvalDepth++;
-    auto result = original(InCmdList, InFeatureHandle, InParameters, InCallback);
-    g_realNvngxEvalDepth--;
-
-    if (result != NVSDK_NGX_Result_Success)
-        LOG_WARN("MetalFX D3D12_EvaluateFeature result id {0}: {1:X}", handleId, (UINT) result);
-    else if (evalLogs <= 8)
-        LOG_INFO("MetalFX D3D12_EvaluateFeature result id {0}: {1:X}", handleId, (UINT) result);
-
-    return result;
-}
-
-// Streamline resolves system32 nvngx with GetProcAddress and never calls Opti's export.
-// Hand back these wrappers so CreateFeature/Evaluate hit MetalFX on the calling thread.
-// Do not DetourAttach the Wine builtin; that patch does not see the call and can stall boot.
-FARPROC NGX_ResolveMetalFxExport(HMODULE hModule, LPCSTR lpProcName)
-{
-    if (!Config::Instance()->NgxDlssPassthrough() || lpProcName == nullptr ||
-        (uintptr_t) lpProcName < 0x10000)
-        return nullptr;
-
-    if (hModule == nullptr || hModule != NVNGXProxy::NVNGXModule())
-        return nullptr;
-
-    if (strcmp(lpProcName, "NVSDK_NGX_D3D12_CreateFeature") == 0)
-    {
-        LOG_INFO("GetProcAddress NVSDK_NGX_D3D12_CreateFeature -> MetalFX wrapper");
-        return (FARPROC) Hooked_Real_D3D12_CreateFeature;
-    }
-
-    if (strcmp(lpProcName, "NVSDK_NGX_D3D12_EvaluateFeature") == 0)
-    {
-        LOG_INFO("GetProcAddress NVSDK_NGX_D3D12_EvaluateFeature -> MetalFX wrapper");
-        return (FARPROC) Hooked_Real_D3D12_EvaluateFeature;
-    }
-
-    return nullptr;
-}
-
 
 // Call original nvngx with re-entry suppressed. Apple/system nvngx may LoadLibrary("nvngx.dll"),
 // which Opti answers with itself when EnableDlssInputs is on.

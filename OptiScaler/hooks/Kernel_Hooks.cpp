@@ -12,8 +12,6 @@
 #include <State.h>
 #include <Config.h>
 
-extern FARPROC NGX_ResolveMetalFxExport(HMODULE hModule, LPCSTR lpProcName);
-
 #include <cwctype>
 
 #include "Hook_Utils.h"
@@ -115,12 +113,6 @@ FARPROC WINAPI KernelHooks::hk_K32_GetProcAddress(HMODULE hModule, LPCSTR lpProc
         return (FARPROC) &hkAmdExtD3DCreateInterface;
     }
 
-    if (lpProcName != nullptr)
-    {
-        if (auto redirected = NGX_ResolveMetalFxExport(hModule, lpProcName))
-            return redirected;
-    }
-
     return o_K32_GetProcAddress(hModule, lpProcName);
 }
 
@@ -189,12 +181,6 @@ FARPROC WINAPI KernelHooks::hk_KB_GetProcAddress(HMODULE hModule, LPCSTR lpProcN
     //     LOG_TRACE("Trying to get process address of {}, caller: {}", lpProcName,
     //               Util::WhoIsTheCaller(_ReturnAddress()));
     // }
-
-    if (lpProcName != nullptr)
-    {
-        if (auto redirected = NGX_ResolveMetalFxExport(hModule, lpProcName))
-            return redirected;
-    }
 
     return o_KB_GetProcAddress(hModule, lpProcName);
 }

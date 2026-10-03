@@ -40,6 +40,7 @@ sl1::pfunLogMessageCallback* StreamlineHooks::o_logCallback_sl1 = nullptr;
 StreamlineHooks::PFN_slGetPluginFunction StreamlineHooks::o_dlss_slGetPluginFunction = nullptr;
 StreamlineHooks::PFN_slOnPluginLoad StreamlineHooks::o_dlss_slOnPluginLoad = nullptr;
 decltype(&slDLSSGetOptimalSettings) StreamlineHooks::o_slDLSSGetOptimalSettings = nullptr;
+PFun_slAllocateResources* StreamlineHooks::o_dlss_slAllocateResources = nullptr;
 
 // DLSSG
 StreamlineHooks::PFN_slGetPluginFunction StreamlineHooks::o_dlssg_slGetPluginFunction = nullptr;
@@ -282,8 +283,28 @@ sl::Result StreamlineHooks::hkslEvaluateFeature(sl::Feature feature, const sl::F
 sl::Result StreamlineHooks::hkslAllocateResources(sl::CommandBuffer* cmdBuffer, sl::Feature feature,
                                                   const sl::ViewportHandle& viewport)
 {
-    LOG_FUNC();
+    // Interposer export. sl.dlss does the real NGX create; this log shows the game asked.
+    LOG_INFO("MetalFX slAllocateResources(interposer) entry feature {0}", (uint32_t) feature);
     auto result = o_slAllocateResources(cmdBuffer, feature, viewport);
+    LOG_INFO("MetalFX slAllocateResources(interposer) result feature {0}: {1}", (uint32_t) feature, (int) result);
+    return result;
+}
+
+sl::Result StreamlineHooks::hkdlss_slAllocateResources(sl::CommandBuffer* cmdBuffer, sl::Feature feature,
+                                                       const sl::ViewportHandle& viewport)
+{
+    // This is the pointer Streamline stores from sl.dlss slGetPluginFunction.
+    // It calls D3DMetal nvngx CreateFeature. No Opti FSR feature is built here.
+    const bool dlss = feature == sl::kFeatureDLSS;
+    LOG_INFO("MetalFX sl.dlss slAllocateResources entry feature {0}{1}", (uint32_t) feature,
+             dlss ? " (DLSS -> D3DMetal nvngx CreateFeature)" : "");
+    if (o_dlss_slAllocateResources == nullptr)
+    {
+        LOG_ERROR("MetalFX sl.dlss slAllocateResources original missing");
+        return sl::Result::eErrorMissingOrInvalidAPI;
+    }
+    auto result = o_dlss_slAllocateResources(cmdBuffer, feature, viewport);
+    LOG_INFO("MetalFX sl.dlss slAllocateResources result feature {0}: {1}", (uint32_t) feature, (int) result);
     return result;
 }
 
@@ -807,6 +828,20 @@ void* StreamlineHooks::hkdlss_slGetPluginFunction(const char* functionName)
         return &hkslDLSSGetOptimalSettings;
     }
 
+    if (strcmp(functionName, "slAllocateResources") == 0)
+    {
+        auto real = (PFun_slAllocateResources*) o_dlss_slGetPluginFunction(functionName);
+        if (real == nullptr)
+        {
+            LOG_WARN("MetalFX: sl.dlss slAllocateResources export is null; CreateFeature will not come from this plugin");
+            return nullptr;
+        }
+        o_dlss_slAllocateResources = real;
+        LOG_INFO("MetalFX: installed sl.dlss slAllocateResources wrapper at {0:X} (forwards to D3DMetal nvngx, no FSR)",
+                 (uint64_t) real);
+        return (void*) &hkdlss_slAllocateResources;
+    }
+
     return o_dlss_slGetPluginFunction(functionName);
 }
 
@@ -1182,8 +1217,13 @@ void StreamlineHooks::hookInterposer(HMODULE slInterposer)
                 if (o_slEvaluateFeature != nullptr)
                     DetourAttach(&(PVOID&) o_slEvaluateFeature, hkslEvaluateFeature);
 
-                // if (o_slAllocateResources != nullptr)
-                //     DetourAttach(&(PVOID&) o_slAllocateResources, hkslAllocateResources);
+                if (o_slAllocateResources != nullptr)
+                {
+                    DetourAttach(&(PVOID&) o_slAllocateResources, hkslAllocateResources);
+                    LOG_INFO("MetalFX: detoured sl.interposer slAllocateResources");
+                }
+                else
+                    LOG_WARN("MetalFX: sl.interposer slAllocateResources export missing");
 
                 // if (o_slGetNativeInterface != nullptr)
                 //     DetourAttach(&(PVOID&) o_slGetNativeInterface, hkslGetNativeInterface);

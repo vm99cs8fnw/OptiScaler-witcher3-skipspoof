@@ -145,9 +145,12 @@ class StreamlineHooks
     static PFN_slGetPluginFunction o_dlss_slGetPluginFunction;
     static PFN_slOnPluginLoad o_dlss_slOnPluginLoad;
     static decltype(&slDLSSGetOptimalSettings) o_slDLSSGetOptimalSettings;
+    static PFun_slAllocateResources* o_dlss_slAllocateResources;
 
     static bool hkdlss_slOnPluginLoad(sl::param::IParameters* params, const char* loaderJSON, const char** pluginJSON);
     static sl::Result hkslDLSSGetOptimalSettings(const sl::DLSSOptions& options, sl::DLSSOptimalSettings& settings);
+    static sl::Result hkdlss_slAllocateResources(sl::CommandBuffer* cmdBuffer, sl::Feature feature,
+                                                 const sl::ViewportHandle& viewport);
     static void* hkdlss_slGetPluginFunction(const char* functionName);
 
     // DLSSG
@@ -214,6 +217,7 @@ class StreamlineHooks
     VALIDATE_MEMBER_HOOK(hkslSetD3DDevice, decltype(&slSetD3DDevice))
     VALIDATE_MEMBER_HOOK(hkdlss_slOnPluginLoad, PFN_slOnPluginLoad)
     VALIDATE_MEMBER_HOOK(hkslDLSSGetOptimalSettings, decltype(&slDLSSGetOptimalSettings))
+    VALIDATE_MEMBER_HOOK(hkdlss_slAllocateResources, PFun_slAllocateResources)
     VALIDATE_MEMBER_HOOK(hkdlss_slGetPluginFunction, PFN_slGetPluginFunction)
     VALIDATE_MEMBER_HOOK(hkdlssg_slOnPluginLoad, PFN_slOnPluginLoad)
     VALIDATE_MEMBER_HOOK(hkslSetConstants, decltype(&slSetConstants))

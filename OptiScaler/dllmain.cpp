@@ -888,8 +888,9 @@ static void CheckWorkingMode()
                 LOG_DEBUG("Check for d3d12");
                 HMODULE d3d12Module = nullptr;
                 d3d12Module = GetDllNameWModule(&dx12NamesW);
-                // OverlayMenu=false used to skip D3D12 hooks and Witcher never reached Present.
-                if (d3d12Module != nullptr)
+                // Keep d2ed534 boot: D3D12 device hooks only when the overlay is on.
+                // Forcing them with OverlayMenu=false (dbca4cc) black-screened after 3 presents.
+                if (Config::Instance()->OverlayMenu.value() && d3d12Module != nullptr)
                 {
                     LOG_DEBUG("d3d12.dll already in memory");
                     D3d12Proxy::Init(d3d12Module);
