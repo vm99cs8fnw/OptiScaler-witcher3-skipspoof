@@ -88,10 +88,10 @@ static inline HMODULE CheckLoad(const std::wstring& name)
 // sl.common resolves NVSDK_NGX_D3D12_CreateFeature itself. Witcher never calls
 // slAllocateResources. Redirect only this export, and only after the name matches,
 // so the rest of GetProcAddress stays on the fast path (a blanket redirect black-screened).
-extern NVSDK_NGX_Result MetalFx_D3D12_CreateFeature_Forward(ID3D12GraphicsCommandList* InCmdList,
-                                                            NVSDK_NGX_Feature InFeatureID,
-                                                            NVSDK_NGX_Parameter* InParameters,
-                                                            NVSDK_NGX_Handle** OutHandle);
+extern "C" NVSDK_NGX_Result MetalFx_D3D12_CreateFeature_Forward(ID3D12GraphicsCommandList* InCmdList,
+                                                                   NVSDK_NGX_Feature InFeatureID,
+                                                                   NVSDK_NGX_Parameter* InParameters,
+                                                                   NVSDK_NGX_Handle** OutHandle);
 
 static FARPROC MetalFxCreateFeatureFromGetProcAddress(HMODULE hModule, LPCSTR lpProcName, FARPROC real)
 {
