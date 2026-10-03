@@ -21,10 +21,6 @@
 #include <shared_mutex>
 #include "detours/detours.h"
 #include <ankerl/unordered_dense.h>
-#include <atomic>
-#include <chrono>
-#include <memory>
-#include <thread>
 
 static ankerl::unordered_dense::map<unsigned int, ContextData<IFeature_Dx12>> Dx12Contexts;
 
@@ -55,23 +51,26 @@ static bool NgxPassthrough() { return Config::Instance()->NgxDlssPassthrough(); 
 static thread_local int g_realNvngxCreateDepth = 0;
 static thread_local int g_realNvngxEvalDepth = 0;
 
-static NVSDK_NGX_Result CreateOptiFsrDx12(ID3D12GraphicsCommandList* InCmdList, NVSDK_NGX_Feature InFeatureID,
-                                          NVSDK_NGX_Parameter* InParameters, NVSDK_NGX_Handle** OutHandle);
-
-static NVSDK_NGX_Result ForwardRealCreateOrFsr(ID3D12GraphicsCommandList* InCmdList, NVSDK_NGX_Feature InFeatureID,
-                                               NVSDK_NGX_Parameter* InParameters, NVSDK_NGX_Handle** OutHandle)
+// Call CrossOver system32 nvngx (MetalFX) on this thread and return its result.
+// No FSR feature, no worker thread: a command list is not free-threaded, and a
+// timeout used to return while MetalFX was still running.
+static NVSDK_NGX_Result CallMetalFxCreateFeature(ID3D12GraphicsCommandList* InCmdList, NVSDK_NGX_Feature InFeatureID,
+                                                 NVSDK_NGX_Parameter* InParameters, NVSDK_NGX_Handle** OutHandle)
 {
+    auto original = NVNGXProxy::D3D12_CreateFeatureRaw();
+
     if (g_realNvngxCreateDepth > 0)
     {
-        LOG_WARN("real nvngx D3D12_CreateFeature re-entered from original, not calling it again");
-        return NVSDK_NGX_Result_FAIL_FeatureNotSupported;
+        if (original == nullptr)
+            return NVSDK_NGX_Result_FAIL_FeatureNotSupported;
+        return original(InCmdList, InFeatureID, InParameters, OutHandle);
     }
 
-    LOG_INFO("real nvngx D3D12_CreateFeature entry feature {0}", (int) InFeatureID);
+    LOG_INFO("MetalFX D3D12_CreateFeature entry feature {0}", (int) InFeatureID);
 
     if (OutHandle == nullptr)
     {
-        LOG_ERROR("real nvngx D3D12_CreateFeature OutHandle is null");
+        LOG_ERROR("MetalFX D3D12_CreateFeature OutHandle is null");
         return NVSDK_NGX_Result_FAIL_InvalidParameter;
     }
 
@@ -79,7 +78,7 @@ static NVSDK_NGX_Result ForwardRealCreateOrFsr(ID3D12GraphicsCommandList* InCmdL
     {
         auto deviceResult = InCmdList->GetDevice(IID_PPV_ARGS(&D3D12Device));
         if (deviceResult != S_OK)
-            LOG_WARN("CreateFeature GetDevice failed: {0:X}", (UINT) deviceResult);
+            LOG_WARN("MetalFX CreateFeature GetDevice failed: {0:X}", (UINT) deviceResult);
     }
 
     if (NVNGXProxy::NVNGXModule() == nullptr)
@@ -88,175 +87,31 @@ static NVSDK_NGX_Result ForwardRealCreateOrFsr(ID3D12GraphicsCommandList* InCmdL
     if (!NVNGXProxy::IsDx12Inited() && D3D12Device != nullptr)
         NVNGXProxy::InitDx12(D3D12Device);
 
-    auto original = NVNGXProxy::D3D12_CreateFeatureRaw();
+    original = NVNGXProxy::D3D12_CreateFeatureRaw();
     if (original == nullptr)
     {
-        LOG_ERROR("real nvngx D3D12_CreateFeature missing, FSR fallback");
-        return CreateOptiFsrDx12(InCmdList, InFeatureID, InParameters, OutHandle);
-    }
-
-    struct CreatePack
-    {
-        PFN_D3D12_CreateFeature fn = nullptr;
-        ID3D12GraphicsCommandList* cmd = nullptr;
-        NVSDK_NGX_Feature feature = NVSDK_NGX_Feature_SuperSampling;
-        NVSDK_NGX_Parameter* params = nullptr;
-        NVSDK_NGX_Handle* handle = nullptr;
-        NVSDK_NGX_Result result = NVSDK_NGX_Result_Fail;
-        std::atomic<int> done { 0 };
-    };
-
-    auto pack = std::make_shared<CreatePack>();
-    pack->fn = original;
-    pack->cmd = InCmdList;
-    pack->feature = InFeatureID;
-    pack->params = InParameters;
-
-    // Original MetalFX CreateFeature has hung the render thread (VRAM climbs, no return).
-    // Run it off-thread and give up so this call returns an FSR feature instead.
-    std::thread([pack]() {
-        g_realNvngxCreateDepth++;
-        NVSDK_NGX_Handle* handle = nullptr;
-        pack->result = pack->fn(pack->cmd, pack->feature, pack->params, &handle);
-        pack->handle = handle;
-        g_realNvngxCreateDepth--;
-        pack->done.store(1, std::memory_order_release);
-    }).detach();
-
-    constexpr auto kTimeout = std::chrono::milliseconds(8000);
-    const auto start = std::chrono::steady_clock::now();
-    while (pack->done.load(std::memory_order_acquire) == 0)
-    {
-        if (std::chrono::steady_clock::now() - start > kTimeout)
-        {
-            LOG_ERROR("real nvngx D3D12_CreateFeature blocked >8s, FSR fallback");
-            return CreateOptiFsrDx12(InCmdList, InFeatureID, InParameters, OutHandle);
-        }
-        std::this_thread::sleep_for(std::chrono::milliseconds(20));
-    }
-
-    LOG_INFO("real nvngx D3D12_CreateFeature result: {0:X} handle {1:X}", (UINT) pack->result,
-             (UINT64) pack->handle);
-
-    if (pack->result == NVSDK_NGX_Result_Success && pack->handle != nullptr)
-    {
-        *OutHandle = pack->handle;
-        LOG_INFO("real nvngx D3D12_CreateFeature ok id {0}", pack->handle->Id);
-        return pack->result;
-    }
-
-    LOG_WARN("real nvngx D3D12_CreateFeature failed ({0:X}), FSR fallback", (UINT) pack->result);
-    return CreateOptiFsrDx12(InCmdList, InFeatureID, InParameters, OutHandle);
-}
-
-static NVSDK_NGX_Result CreateOptiFsrDx12(ID3D12GraphicsCommandList* InCmdList, NVSDK_NGX_Feature InFeatureID,
-                                          NVSDK_NGX_Parameter* InParameters, NVSDK_NGX_Handle** OutHandle)
-{
-    LOG_WARN("creating Opti FSR 2.1 feature after nvngx CreateFeature failure (feature {0})", (int) InFeatureID);
-
-    if (OutHandle == nullptr)
-        return NVSDK_NGX_Result_FAIL_InvalidParameter;
-
-    State::Instance().api = DX12;
-    auto handleId = IFeature::GetNextHandleId();
-    LOG_INFO("FSR fallback HandleId: {0}", handleId);
-
-    if (Config::Instance()->RestoreComputeSignature.value_or_default() ||
-        Config::Instance()->RestoreGraphicSignature.value_or_default())
-    {
-        D3D12Hooks::SetRootSignatureTracking(false);
-        D3D12Hooks::HookToCommandListLate(InCmdList);
-    }
-
-    Dx12Contexts[handleId] = {};
-
-    if (!FeatureProvider_Dx12::GetFeature("fsr21", handleId, InParameters, &Dx12Contexts[handleId].feature))
-    {
-        LOG_ERROR("FSR fallback upscaler can't be created");
-        D3D12Hooks::RestoreRoot(InCmdList);
-        D3D12Hooks::SetRootSignatureTracking(true);
-        return NVSDK_NGX_Result_Fail;
-    }
-
-    auto deviceContext = Dx12Contexts[handleId].feature.get();
-
-    if (*OutHandle == nullptr)
-        *OutHandle = new NVSDK_NGX_Handle { handleId };
-    else
-        (*OutHandle)->Id = handleId;
-
-    if (!D3D12Device)
-    {
-        LOG_DEBUG("Get D3d12 device from InCmdList!");
-        if (InCmdList == nullptr)
-        {
-            LOG_ERROR("FSR fallback InCmdList is null");
-            return NVSDK_NGX_Result_Fail;
-        }
-
-        auto deviceResult = InCmdList->GetDevice(IID_PPV_ARGS(&D3D12Device));
-        if (deviceResult != S_OK || !D3D12Device)
-        {
-            LOG_ERROR("Can't get Dx12Device from InCmdList!");
-            return NVSDK_NGX_Result_Fail;
-        }
-    }
-
-    State::Instance().AutoExposure.reset();
-
-    if (deviceContext->Init(D3D12Device, InCmdList, InParameters))
-    {
-        State::Instance().currentFeature = deviceContext;
-        evalCounter = 0;
-        UpscalerInputsDx12::Reset();
-        LOG_INFO("FSR fallback inited id {0}", handleId);
-    }
-    else
-    {
-        LOG_ERROR("FSR fallback init failed, scheduling fsr21 change");
-        State::Instance().newBackend = "fsr21";
-        State::Instance().changeBackend[handleId] = true;
-    }
-
-    D3D12Hooks::RestoreRoot(InCmdList);
-    D3D12Hooks::SetRootSignatureTracking(true);
-    State::Instance().FGchanged = true;
-
-    return NVSDK_NGX_Result_Success;
-}
-
-static NVSDK_NGX_Result __stdcall Hooked_Real_D3D12_CreateFeature(ID3D12GraphicsCommandList* InCmdList,
-                                                                  NVSDK_NGX_Feature InFeatureID,
-                                                                  NVSDK_NGX_Parameter* InParameters,
-                                                                  NVSDK_NGX_Handle** OutHandle)
-{
-    if (g_realNvngxCreateDepth > 0)
-    {
-        auto original = NVNGXProxy::D3D12_CreateFeatureRaw();
-        if (original == nullptr)
-            return NVSDK_NGX_Result_FAIL_FeatureNotSupported;
-        return original(InCmdList, InFeatureID, InParameters, OutHandle);
-    }
-
-    if (InFeatureID == NVSDK_NGX_Feature_SuperSampling || InFeatureID == NVSDK_NGX_Feature_RayReconstruction)
-        return ForwardRealCreateOrFsr(InCmdList, InFeatureID, InParameters, OutHandle);
-
-    LOG_INFO("real nvngx D3D12_CreateFeature entry feature {0} (not DLSS)", (int) InFeatureID);
-    auto original = NVNGXProxy::D3D12_CreateFeatureRaw();
-    if (original == nullptr)
-    {
-        LOG_ERROR("real nvngx D3D12_CreateFeature missing");
+        LOG_ERROR("MetalFX D3D12_CreateFeature export missing");
         return NVSDK_NGX_Result_FAIL_FeatureNotSupported;
     }
 
     g_realNvngxCreateDepth++;
     auto result = original(InCmdList, InFeatureID, InParameters, OutHandle);
     g_realNvngxCreateDepth--;
-    LOG_INFO("real nvngx D3D12_CreateFeature result feature {0}: {1:X}", (int) InFeatureID, (UINT) result);
+
+    LOG_INFO("MetalFX D3D12_CreateFeature result feature {0}: {1:X} handle {2:X}", (int) InFeatureID, (UINT) result,
+             (UINT64) (uintptr_t) (OutHandle != nullptr ? *OutHandle : nullptr));
     return result;
 }
 
-static NVSDK_NGX_Result __stdcall Hooked_Real_D3D12_EvaluateFeature(ID3D12GraphicsCommandList* InCmdList,
+static NVSDK_NGX_Result Hooked_Real_D3D12_CreateFeature(ID3D12GraphicsCommandList* InCmdList,
+                                                                  NVSDK_NGX_Feature InFeatureID,
+                                                                  NVSDK_NGX_Parameter* InParameters,
+                                                                  NVSDK_NGX_Handle** OutHandle)
+{
+    return CallMetalFxCreateFeature(InCmdList, InFeatureID, InParameters, OutHandle);
+}
+
+static NVSDK_NGX_Result Hooked_Real_D3D12_EvaluateFeature(ID3D12GraphicsCommandList* InCmdList,
                                                                     const NVSDK_NGX_Handle* InFeatureHandle,
                                                                     const NVSDK_NGX_Parameter* InParameters,
                                                                     PFN_NVSDK_NGX_ProgressCallback InCallback)
@@ -273,14 +128,15 @@ static NVSDK_NGX_Result __stdcall Hooked_Real_D3D12_EvaluateFeature(ID3D12Graphi
     static int evalLogs = 0;
     if (evalLogs < 8)
     {
-        LOG_INFO("real nvngx D3D12_EvaluateFeature entry id {0}", handleId);
+        LOG_INFO("MetalFX D3D12_EvaluateFeature entry id {0}", handleId);
         evalLogs++;
     }
     else
     {
-        LOG_DEBUG("real nvngx D3D12_EvaluateFeature entry id {0}", handleId);
+        LOG_DEBUG("MetalFX D3D12_EvaluateFeature entry id {0}", handleId);
     }
 
+    // Opti-created handles (not used on the MetalFX passthrough path).
     if (InFeatureHandle != nullptr && handleId >= DLSS_MOD_ID_OFFSET)
         return NVSDK_NGX_D3D12_EvaluateFeature(InCmdList, InFeatureHandle, const_cast<NVSDK_NGX_Parameter*>(InParameters),
                                                InCallback);
@@ -288,7 +144,7 @@ static NVSDK_NGX_Result __stdcall Hooked_Real_D3D12_EvaluateFeature(ID3D12Graphi
     auto original = NVNGXProxy::D3D12_EvaluateFeatureRaw();
     if (original == nullptr)
     {
-        LOG_ERROR("real nvngx D3D12_EvaluateFeature missing id {0}", handleId);
+        LOG_ERROR("MetalFX D3D12_EvaluateFeature export missing id {0}", handleId);
         return NVSDK_NGX_Result_FAIL_FeatureNotFound;
     }
 
@@ -297,22 +153,38 @@ static NVSDK_NGX_Result __stdcall Hooked_Real_D3D12_EvaluateFeature(ID3D12Graphi
     g_realNvngxEvalDepth--;
 
     if (result != NVSDK_NGX_Result_Success)
-        LOG_WARN("real nvngx D3D12_EvaluateFeature result id {0}: {1:X}", handleId, (UINT) result);
+        LOG_WARN("MetalFX D3D12_EvaluateFeature result id {0}: {1:X}", handleId, (UINT) result);
     else if (evalLogs <= 8)
-        LOG_INFO("real nvngx D3D12_EvaluateFeature result id {0}: {1:X}", handleId, (UINT) result);
+        LOG_INFO("MetalFX D3D12_EvaluateFeature result id {0}: {1:X}", handleId, (UINT) result);
 
     return result;
 }
 
-void HookRealNvngxDx12FeatureExports()
+// Streamline resolves system32 nvngx with GetProcAddress and never calls Opti's export.
+// Hand back these wrappers so CreateFeature/Evaluate hit MetalFX on the calling thread.
+// Do not DetourAttach the Wine builtin; that patch does not see the call and can stall boot.
+FARPROC NGX_ResolveMetalFxExport(HMODULE hModule, LPCSTR lpProcName)
 {
-    static bool attempted = false;
-    if (attempted)
-        return;
-    attempted = true;
+    if (!Config::Instance()->NgxDlssPassthrough() || lpProcName == nullptr ||
+        (uintptr_t) lpProcName < 0x10000)
+        return nullptr;
 
-    if (!NVNGXProxy::HookD3D12CreateEvaluate(Hooked_Real_D3D12_CreateFeature, Hooked_Real_D3D12_EvaluateFeature))
-        LOG_ERROR("real nvngx Create/Evaluate detour was not installed");
+    if (hModule == nullptr || hModule != NVNGXProxy::NVNGXModule())
+        return nullptr;
+
+    if (strcmp(lpProcName, "NVSDK_NGX_D3D12_CreateFeature") == 0)
+    {
+        LOG_INFO("GetProcAddress NVSDK_NGX_D3D12_CreateFeature -> MetalFX wrapper");
+        return (FARPROC) Hooked_Real_D3D12_CreateFeature;
+    }
+
+    if (strcmp(lpProcName, "NVSDK_NGX_D3D12_EvaluateFeature") == 0)
+    {
+        LOG_INFO("GetProcAddress NVSDK_NGX_D3D12_EvaluateFeature -> MetalFX wrapper");
+        return (FARPROC) Hooked_Real_D3D12_EvaluateFeature;
+    }
+
+    return nullptr;
 }
 
 
@@ -916,11 +788,11 @@ NVSDK_NGX_API NVSDK_NGX_Result NVSDK_NGX_D3D12_CreateFeature(ID3D12GraphicsComma
         }
     }
 
-    // DLSS / MetalFX: try the real nvngx create. On failure or hang, build an Opti FSR feature so boot continues.
+    // DLSS / DLSS-D: Streamline's create must run as CrossOver MetalFX and return that result.
     if (NgxPassthrough() &&
         (InFeatureID == NVSDK_NGX_Feature_SuperSampling || InFeatureID == NVSDK_NGX_Feature_RayReconstruction))
     {
-        return ForwardRealCreateOrFsr(InCmdList, InFeatureID, InParameters, OutHandle);
+        return CallMetalFxCreateFeature(InCmdList, InFeatureID, InParameters, OutHandle);
     }
 
     // Create feature
@@ -1153,12 +1025,13 @@ NVSDK_NGX_API NVSDK_NGX_Result NVSDK_NGX_D3D12_EvaluateFeature(ID3D12GraphicsCom
 
     if (handleId < DLSS_MOD_ID_OFFSET)
     {
-        if (Config::Instance()->DLSSEnabled.value_or_default() && NVNGXProxy::D3D12_EvaluateFeature() != nullptr)
+        auto evalFn = NgxPassthrough() ? NVNGXProxy::D3D12_EvaluateFeatureRaw() : NVNGXProxy::D3D12_EvaluateFeature();
+        if (Config::Instance()->DLSSEnabled.value_or_default() && evalFn != nullptr)
         {
             if (NgxPassthrough())
-                LOG_INFO("NGX passthrough D3D12_EvaluateFeature ({0})", handleId);
+                LOG_INFO("MetalFX D3D12_EvaluateFeature via Opti export ({0})", handleId);
             LOG_DEBUG("D3D12_EvaluateFeature for ({0})", handleId);
-            auto result = NVNGXProxy::D3D12_EvaluateFeature()(InCmdList, InFeatureHandle, InParameters, InCallback);
+            auto result = evalFn(InCmdList, InFeatureHandle, InParameters, InCallback);
             LOG_DEBUG("D3D12_EvaluateFeature result for ({0}): {1:X}", handleId, (UINT) result);
             return result;
         }

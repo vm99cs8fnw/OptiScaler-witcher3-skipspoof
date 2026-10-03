@@ -611,9 +611,8 @@ class NVNGXProxy
             _module.UpdateFeature =
                 (PFN_UpdateFeature) KernelBaseProxy::GetProcAddress_()(_module.dll, "NVSDK_NGX_UpdateFeature");
 
-            // Streamline calls system32 nvngx exports directly, bypassing Opti's dxgi exports.
-            extern void HookRealNvngxDx12FeatureExports();
-            HookRealNvngxDx12FeatureExports();
+            // Do not DetourAttach Wine's nvngx. Streamline's GetProcAddress is redirected
+            // to NGX_ResolveMetalFxExport, which calls these saved pointers.
         }
     }
 
