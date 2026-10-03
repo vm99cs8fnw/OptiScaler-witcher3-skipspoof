@@ -610,6 +610,10 @@ class NVNGXProxy
 
             _module.UpdateFeature =
                 (PFN_UpdateFeature) KernelBaseProxy::GetProcAddress_()(_module.dll, "NVSDK_NGX_UpdateFeature");
+
+            // Streamline calls system32 nvngx exports directly, bypassing Opti's dxgi exports.
+            extern void HookRealNvngxDx12FeatureExports();
+            HookRealNvngxDx12FeatureExports();
         }
     }
 
@@ -844,6 +848,38 @@ class NVNGXProxy
             return nullptr;
 
         return _module.D3D12_EvaluateFeature;
+    }
+
+    // After DetourAttach these are the trampolines. Not gated on Dx12 init:
+    // Streamline can enter the real export before Opti marks init.
+    static PFN_D3D12_CreateFeature D3D12_CreateFeatureRaw() { return _module.D3D12_CreateFeature; }
+
+    static PFN_D3D12_EvaluateFeature D3D12_EvaluateFeatureRaw() { return _module.D3D12_EvaluateFeature; }
+
+    static bool HookD3D12CreateEvaluate(PFN_D3D12_CreateFeature hookCreate, PFN_D3D12_EvaluateFeature hookEval)
+    {
+        if (_module.D3D12_CreateFeature == nullptr && _module.D3D12_EvaluateFeature == nullptr)
+            return false;
+
+        DetourTransactionBegin();
+        DetourUpdateThread(GetCurrentThread());
+
+        if (hookCreate != nullptr && _module.D3D12_CreateFeature != nullptr)
+            DetourAttach(&(PVOID&) _module.D3D12_CreateFeature, hookCreate);
+
+        if (hookEval != nullptr && _module.D3D12_EvaluateFeature != nullptr)
+            DetourAttach(&(PVOID&) _module.D3D12_EvaluateFeature, hookEval);
+
+        auto detourResult = DetourTransactionCommit();
+        if (detourResult != NO_ERROR)
+        {
+            LOG_ERROR("Failed to hook real nvngx D3D12 Create/Evaluate: {:X}", detourResult);
+            return false;
+        }
+
+        LOG_INFO("Hooked real nvngx D3D12_CreateFeature/EvaluateFeature on {}",
+                 wstring_to_string(_module.filePath));
+        return true;
     }
 
     static PFN_D3D12_ReleaseFeature D3D12_ReleaseFeature()

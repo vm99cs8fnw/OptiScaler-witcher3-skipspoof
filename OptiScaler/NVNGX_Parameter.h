@@ -407,6 +407,26 @@ inline static NVSDK_NGX_Result NVSDK_CONV NVSDK_NGX_DLSS_GetStatsCallback(NVSDK_
     return NVSDK_NGX_Result_Success;
 }
 
+// Install Opti's GetOptimalSettings callback only when the original nvngx map has none.
+// Replacing a live MetalFX callback stalls Witcher before CreateFeature.
+inline static void InstallOptimalCallbackIfMissing(NVSDK_NGX_Parameter* InParams)
+{
+    if (InParams == nullptr)
+        return;
+
+    void* callback = nullptr;
+    auto result = InParams->Get(NVSDK_NGX_Parameter_DLSSOptimalSettingsCallback, &callback);
+    if (result == NVSDK_NGX_Result_Success && callback != nullptr)
+    {
+        LOG_INFO("DLSSOptimalSettingsCallback already present ({0:X})", (UINT64) callback);
+        return;
+    }
+
+    LOG_WARN("DLSSOptimalSettingsCallback missing (get {0:X}), installing Opti callback", (UINT) result);
+    InParams->Set(NVSDK_NGX_Parameter_DLSSOptimalSettingsCallback, NVSDK_NGX_DLSS_GetOptimalSettingsCallback);
+    InParams->Set(NVSDK_NGX_EParameter_DLSSOptimalSettingsCallback, NVSDK_NGX_DLSS_GetOptimalSettingsCallback);
+}
+
 /// @brief Initializes an NGX parameter object with supported feature flags (DLSS, FrameGen), version info, and default
 /// values.
 inline static void InitNGXParameters(NVSDK_NGX_Parameter* InParams, bool installOptimalCallbacks = true)
