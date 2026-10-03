@@ -224,20 +224,6 @@ sl::Result StreamlineHooks::hkslSetTagForFrame(const sl::FrameToken& frame, cons
     }
 
     LOG_DEBUG("frameIndex: {}", static_cast<uint32_t>(frame));
-    {
-        static int any = 0;
-        static int dlss = 0;
-        const bool isDlss = feature == sl::kFeatureDLSS;
-        if (any < 4 || (isDlss && dlss < 12))
-        {
-            if (any < 4)
-                any++;
-            if (isDlss)
-                dlss++;
-            LOG_INFO("MetalFX slEvaluateFeature(interposer) entry feature {0} frame {1}", (uint32_t) feature,
-                     static_cast<uint32_t>(frame));
-        }
-    }
 
     for (uint32_t i = 0; i < numResources; i++)
     {
@@ -271,6 +257,20 @@ sl::Result StreamlineHooks::hkslEvaluateFeature(sl::Feature feature, const sl::F
                                                 sl::CommandBuffer* cmdBuffer)
 {
     LOG_DEBUG("frameIndex: {}", static_cast<uint32_t>(frame));
+    {
+        static int any = 0;
+        static int dlss = 0;
+        const bool isDlss = feature == sl::kFeatureDLSS;
+        if (any < 4 || (isDlss && dlss < 12))
+        {
+            if (any < 4)
+                any++;
+            if (isDlss)
+                dlss++;
+            LOG_INFO("MetalFX slEvaluateFeature(interposer) entry feature {0} frame {1}", (uint32_t) feature,
+                     static_cast<uint32_t>(frame));
+        }
+    }
 
     if (State::Instance().activeFgInput == FGInput::DLSSG && numInputs > 0 && inputs != nullptr)
     {
