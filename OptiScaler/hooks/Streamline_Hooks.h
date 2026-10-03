@@ -115,6 +115,8 @@ class StreamlineHooks
     static decltype(&slGetNativeInterface) o_slGetNativeInterface;
     static decltype(&slSetD3DDevice) o_slSetD3DDevice;
     static decltype(&slGetNewFrameToken) o_slGetNewFrameToken;
+    static decltype(&slGetFeatureFunction) o_slGetFeatureFunction;
+    static decltype(&slIsFeatureSupported) o_slIsFeatureSupported;
 
     static decltype(&sl1::slInit) o_slInit_sl1;
 
@@ -140,17 +142,23 @@ class StreamlineHooks
     static sl::Result hkslGetNativeInterface(void* proxyInterface, void** baseInterface);
 
     static sl::Result hkslSetD3DDevice(void* d3dDevice);
+    static sl::Result hkslGetFeatureFunction(sl::Feature feature, const char* functionName, void*& function);
+    static sl::Result hkslIsFeatureSupported(sl::Feature feature, const sl::AdapterInfo& adapterInfo);
 
     // DLSS
     static PFN_slGetPluginFunction o_dlss_slGetPluginFunction;
     static PFN_slOnPluginLoad o_dlss_slOnPluginLoad;
     static decltype(&slDLSSGetOptimalSettings) o_slDLSSGetOptimalSettings;
     static PFun_slAllocateResources* o_dlss_slAllocateResources;
+    static decltype(&slDLSSSetOptions) o_dlss_slDLSSSetOptions;
+    static decltype(&slDLSSGetState) o_dlss_slDLSSGetState;
 
     static bool hkdlss_slOnPluginLoad(sl::param::IParameters* params, const char* loaderJSON, const char** pluginJSON);
     static sl::Result hkslDLSSGetOptimalSettings(const sl::DLSSOptions& options, sl::DLSSOptimalSettings& settings);
     static sl::Result hkdlss_slAllocateResources(sl::CommandBuffer* cmdBuffer, sl::Feature feature,
                                                  const sl::ViewportHandle& viewport);
+    static sl::Result hkdlss_slDLSSSetOptions(const sl::ViewportHandle& viewport, const sl::DLSSOptions& options);
+    static sl::Result hkdlss_slDLSSGetState(const sl::ViewportHandle& viewport, sl::DLSSState& state);
     static void* hkdlss_slGetPluginFunction(const char* functionName);
 
     // DLSSG
@@ -194,10 +202,14 @@ class StreamlineHooks
     static PFN_slOnPluginLoad o_common_slOnPluginLoad;
     static PFN_slSetParameters_sl1 o_common_slSetParameters_sl1;
     static PFN_setVoid o_setVoid;
+    static decltype(&slEvaluateFeature) o_common_slEvaluateFeature;
 
     static bool hkcommon_slOnPluginLoad(sl::param::IParameters* params, const char* loaderJSON,
                                         const char** pluginJSON);
     static void* hkcommon_slGetPluginFunction(const char* functionName);
+    static sl::Result hkcommon_slEvaluateFeature(sl::Feature feature, const sl::FrameToken& frame,
+                                                 const sl::BaseStructure** inputs, uint32_t numInputs,
+                                                 sl::CommandBuffer* cmdBuffer);
     static void hkcommon_slSetParameters_sl1(void* params);
     static bool hk_setVoid(void* self, const char* key, void** value);
 
@@ -215,9 +227,13 @@ class StreamlineHooks
     VALIDATE_MEMBER_HOOK(hkslAllocateResources, decltype(&slAllocateResources))
     VALIDATE_MEMBER_HOOK(hkslGetNativeInterface, decltype(&slGetNativeInterface))
     VALIDATE_MEMBER_HOOK(hkslSetD3DDevice, decltype(&slSetD3DDevice))
+    VALIDATE_MEMBER_HOOK(hkslGetFeatureFunction, decltype(&slGetFeatureFunction))
+    VALIDATE_MEMBER_HOOK(hkslIsFeatureSupported, decltype(&slIsFeatureSupported))
     VALIDATE_MEMBER_HOOK(hkdlss_slOnPluginLoad, PFN_slOnPluginLoad)
     VALIDATE_MEMBER_HOOK(hkslDLSSGetOptimalSettings, decltype(&slDLSSGetOptimalSettings))
     VALIDATE_MEMBER_HOOK(hkdlss_slAllocateResources, decltype(&slAllocateResources))
+    VALIDATE_MEMBER_HOOK(hkdlss_slDLSSSetOptions, decltype(&slDLSSSetOptions))
+    VALIDATE_MEMBER_HOOK(hkdlss_slDLSSGetState, decltype(&slDLSSGetState))
     VALIDATE_MEMBER_HOOK(hkdlss_slGetPluginFunction, PFN_slGetPluginFunction)
     VALIDATE_MEMBER_HOOK(hkdlssg_slOnPluginLoad, PFN_slOnPluginLoad)
     VALIDATE_MEMBER_HOOK(hkslSetConstants, decltype(&slSetConstants))
@@ -233,6 +249,7 @@ class StreamlineHooks
     VALIDATE_MEMBER_HOOK(hkslPCLSetMarker, decltype(&slPCLSetMarker))
     VALIDATE_MEMBER_HOOK(hkcommon_slOnPluginLoad, PFN_slOnPluginLoad)
     VALIDATE_MEMBER_HOOK(hkcommon_slGetPluginFunction, PFN_slGetPluginFunction)
+    VALIDATE_MEMBER_HOOK(hkcommon_slEvaluateFeature, decltype(&slEvaluateFeature))
     VALIDATE_MEMBER_HOOK(hkcommon_slSetParameters_sl1, PFN_slSetParameters_sl1)
     VALIDATE_MEMBER_HOOK(hk_setVoid, PFN_setVoid)
 };

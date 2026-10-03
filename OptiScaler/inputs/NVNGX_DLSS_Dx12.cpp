@@ -102,6 +102,16 @@ static NVSDK_NGX_Result CallMetalFxCreateFeature(ID3D12GraphicsCommandList* InCm
     return result;
 }
 
+// Returned only from the one-shot GetProcAddress hook for NVSDK_NGX_D3D12_CreateFeature
+// on a non-Opti module (sl.common's real nvngx). Same thread, no FSR feature.
+NVSDK_NGX_API NVSDK_NGX_Result MetalFx_D3D12_CreateFeature_Forward(ID3D12GraphicsCommandList* InCmdList,
+                                                                   NVSDK_NGX_Feature InFeatureID,
+                                                                   NVSDK_NGX_Parameter* InParameters,
+                                                                   NVSDK_NGX_Handle** OutHandle)
+{
+    return CallMetalFxCreateFeature(InCmdList, InFeatureID, InParameters, OutHandle);
+}
+
 // Call original nvngx with re-entry suppressed. Apple/system nvngx may LoadLibrary("nvngx.dll"),
 // which Opti answers with itself when EnableDlssInputs is on.
 static NVSDK_NGX_Result CallOriginalInitExt(unsigned long long InApplicationId, const wchar_t* InApplicationDataPath,

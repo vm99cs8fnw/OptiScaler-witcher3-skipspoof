@@ -85,6 +85,48 @@ static inline HMODULE CheckLoad(const std::wstring& name)
     return nullptr;
 }
 
+// sl.common resolves NVSDK_NGX_D3D12_CreateFeature itself. Witcher never calls
+// slAllocateResources. Redirect only this export, and only after the name matches,
+// so the rest of GetProcAddress stays on the fast path (a blanket redirect black-screened).
+extern NVSDK_NGX_Result MetalFx_D3D12_CreateFeature_Forward(ID3D12GraphicsCommandList* InCmdList,
+                                                            NVSDK_NGX_Feature InFeatureID,
+                                                            NVSDK_NGX_Parameter* InParameters,
+                                                            NVSDK_NGX_Handle** OutHandle);
+
+static FARPROC MetalFxCreateFeatureFromGetProcAddress(HMODULE hModule, LPCSTR lpProcName, FARPROC real)
+{
+    static bool logged = false;
+    if (!logged)
+    {
+        logged = true;
+        LOG_INFO("MetalFX: GetProcAddress NVSDK_NGX_D3D12_CreateFeature module {0:X} real {1:X}",
+                 (uint64_t) hModule, (uint64_t) real);
+    }
+
+    // Opti's own export already forwards to D3DMetal. Replacing it would recurse
+    // if LoadLibrary("nvngx.dll") returned this dll.
+    if (real == nullptr || hModule == dllModule)
+        return real;
+
+    static bool installed = false;
+    if (!installed)
+    {
+        installed = true;
+        LOG_INFO("MetalFX: installed NVSDK_NGX_D3D12_CreateFeature forwarder (calling thread, D3DMetal nvngx)");
+    }
+    return (FARPROC) &MetalFx_D3D12_CreateFeature_Forward;
+}
+
+static FARPROC MaybeRedirectCreateFeature(HMODULE hModule, LPCSTR lpProcName,
+                                          FARPROC(WINAPI* original)(HMODULE, LPCSTR))
+{
+    if (lpProcName == nullptr || strcmp(lpProcName, "NVSDK_NGX_D3D12_CreateFeature") != 0)
+        return nullptr;
+
+    auto real = original(hModule, lpProcName);
+    return MetalFxCreateFeatureFromGetProcAddress(hModule, lpProcName, real);
+}
+
 VALIDATE_HOOK(hk_K32_GetProcAddress, Kernel32Proxy::PFN_GetProcAddress)
 FARPROC WINAPI KernelHooks::hk_K32_GetProcAddress(HMODULE hModule, LPCSTR lpProcName)
 {
@@ -96,6 +138,9 @@ FARPROC WINAPI KernelHooks::hk_K32_GetProcAddress(HMODULE hModule, LPCSTR lpProc
 
         return o_K32_GetProcAddress(hModule, lpProcName);
     }
+
+    if (lpProcName != nullptr && strcmp(lpProcName, "NVSDK_NGX_D3D12_CreateFeature") == 0)
+        return MaybeRedirectCreateFeature(hModule, lpProcName, o_K32_GetProcAddress);
 
     // if (hModule == dllModule && lpProcName != nullptr)
     //{
@@ -175,6 +220,9 @@ FARPROC WINAPI KernelHooks::hk_KB_GetProcAddress(HMODULE hModule, LPCSTR lpProcN
 
         return o_KB_GetProcAddress(hModule, lpProcName);
     }
+
+    if (lpProcName != nullptr && strcmp(lpProcName, "NVSDK_NGX_D3D12_CreateFeature") == 0)
+        return MaybeRedirectCreateFeature(hModule, lpProcName, o_KB_GetProcAddress);
 
     // if (hModule == dllModule && lpProcName != nullptr)
     //{

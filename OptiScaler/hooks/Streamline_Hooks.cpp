@@ -30,6 +30,8 @@ decltype(&slSetConstants) StreamlineHooks::o_slSetConstants = nullptr;
 decltype(&slGetNativeInterface) StreamlineHooks::o_slGetNativeInterface = nullptr;
 decltype(&slSetD3DDevice) StreamlineHooks::o_slSetD3DDevice = nullptr;
 decltype(&slGetNewFrameToken) StreamlineHooks::o_slGetNewFrameToken = nullptr;
+decltype(&slGetFeatureFunction) StreamlineHooks::o_slGetFeatureFunction = nullptr;
+decltype(&slIsFeatureSupported) StreamlineHooks::o_slIsFeatureSupported = nullptr;
 
 decltype(&sl1::slInit) StreamlineHooks::o_slInit_sl1 = nullptr;
 
@@ -41,6 +43,8 @@ StreamlineHooks::PFN_slGetPluginFunction StreamlineHooks::o_dlss_slGetPluginFunc
 StreamlineHooks::PFN_slOnPluginLoad StreamlineHooks::o_dlss_slOnPluginLoad = nullptr;
 decltype(&slDLSSGetOptimalSettings) StreamlineHooks::o_slDLSSGetOptimalSettings = nullptr;
 PFun_slAllocateResources* StreamlineHooks::o_dlss_slAllocateResources = nullptr;
+decltype(&slDLSSSetOptions) StreamlineHooks::o_dlss_slDLSSSetOptions = nullptr;
+decltype(&slDLSSGetState) StreamlineHooks::o_dlss_slDLSSGetState = nullptr;
 
 // DLSSG
 StreamlineHooks::PFN_slGetPluginFunction StreamlineHooks::o_dlssg_slGetPluginFunction = nullptr;
@@ -65,6 +69,7 @@ StreamlineHooks::PFN_slGetPluginFunction StreamlineHooks::o_common_slGetPluginFu
 StreamlineHooks::PFN_slOnPluginLoad StreamlineHooks::o_common_slOnPluginLoad = nullptr;
 StreamlineHooks::PFN_slSetParameters_sl1 StreamlineHooks::o_common_slSetParameters_sl1 = nullptr;
 StreamlineHooks::PFN_setVoid StreamlineHooks::o_setVoid = nullptr;
+decltype(&slEvaluateFeature) StreamlineHooks::o_common_slEvaluateFeature = nullptr;
 
 char* StreamlineHooks::trimStreamlineLog(const char* msg)
 {
@@ -219,6 +224,20 @@ sl::Result StreamlineHooks::hkslSetTagForFrame(const sl::FrameToken& frame, cons
     }
 
     LOG_DEBUG("frameIndex: {}", static_cast<uint32_t>(frame));
+    {
+        static int any = 0;
+        static int dlss = 0;
+        const bool isDlss = feature == sl::kFeatureDLSS;
+        if (any < 4 || (isDlss && dlss < 12))
+        {
+            if (any < 4)
+                any++;
+            if (isDlss)
+                dlss++;
+            LOG_INFO("MetalFX slEvaluateFeature(interposer) entry feature {0} frame {1}", (uint32_t) feature,
+                     static_cast<uint32_t>(frame));
+        }
+    }
 
     for (uint32_t i = 0; i < numResources; i++)
     {
@@ -305,6 +324,118 @@ sl::Result StreamlineHooks::hkdlss_slAllocateResources(sl::CommandBuffer* cmdBuf
     }
     auto result = o_dlss_slAllocateResources(cmdBuffer, feature, viewport);
     LOG_INFO("MetalFX sl.dlss slAllocateResources result feature {0}: {1}", (uint32_t) feature, (int) result);
+    return result;
+}
+
+
+sl::Result StreamlineHooks::hkslGetFeatureFunction(sl::Feature feature, const char* functionName, void*& function)
+{
+    static int logged = 0;
+    const bool logThis = logged < 48;
+    if (logThis)
+    {
+        logged++;
+        LOG_INFO("MetalFX slGetFeatureFunction entry feature {0} name {1}", (uint32_t) feature,
+                 functionName != nullptr ? functionName : "(null)");
+    }
+
+    auto result = o_slGetFeatureFunction(feature, functionName, function);
+
+    if (logThis)
+        LOG_INFO("MetalFX slGetFeatureFunction result feature {0} name {1} ptr {2:X} result {3}", (uint32_t) feature,
+                 functionName != nullptr ? functionName : "(null)", (uint64_t) function, (int) result);
+
+    if (result == sl::Result::eOk && functionName != nullptr && function != nullptr)
+    {
+        if (strcmp(functionName, "slDLSSSetOptions") == 0 && function != (void*) &hkdlss_slDLSSSetOptions)
+        {
+            o_dlss_slDLSSSetOptions = (decltype(&slDLSSSetOptions)) function;
+            function = (void*) &hkdlss_slDLSSSetOptions;
+            LOG_INFO("MetalFX: installed slDLSSSetOptions wrapper at {0:X}", (uint64_t) o_dlss_slDLSSSetOptions);
+        }
+        else if (strcmp(functionName, "slDLSSGetState") == 0 && function != (void*) &hkdlss_slDLSSGetState)
+        {
+            o_dlss_slDLSSGetState = (decltype(&slDLSSGetState)) function;
+            function = (void*) &hkdlss_slDLSSGetState;
+            LOG_INFO("MetalFX: installed slDLSSGetState wrapper at {0:X}", (uint64_t) o_dlss_slDLSSGetState);
+        }
+    }
+
+    return result;
+}
+
+sl::Result StreamlineHooks::hkslIsFeatureSupported(sl::Feature feature, const sl::AdapterInfo& adapterInfo)
+{
+    LOG_INFO("MetalFX slIsFeatureSupported entry feature {0}", (uint32_t) feature);
+    auto result = o_slIsFeatureSupported(feature, adapterInfo);
+    LOG_INFO("MetalFX slIsFeatureSupported result feature {0}: {1}", (uint32_t) feature, (int) result);
+
+    // Witcher (AAMode=6) will not call slDLSSSetOptions if this fails, so sl.common
+    // never reaches NVSDK_NGX_D3D12_CreateFeature and the load screen sits at 4GB.
+    if (feature == sl::kFeatureDLSS && result != sl::Result::eOk)
+    {
+        LOG_WARN("MetalFX: DLSS slIsFeatureSupported returned {0}, forcing eOk so SetOptions can create MetalFX",
+                 (int) result);
+        return sl::Result::eOk;
+    }
+
+    return result;
+}
+
+sl::Result StreamlineHooks::hkdlss_slDLSSSetOptions(const sl::ViewportHandle& viewport, const sl::DLSSOptions& options)
+{
+    LOG_INFO("MetalFX slDLSSSetOptions entry viewport {0} mode {1} out {2}x{3}", (uint32_t) viewport,
+             (uint32_t) options.mode, options.outputWidth, options.outputHeight);
+    if (o_dlss_slDLSSSetOptions == nullptr)
+    {
+        LOG_ERROR("MetalFX slDLSSSetOptions original missing");
+        return sl::Result::eErrorMissingOrInvalidAPI;
+    }
+    auto result = o_dlss_slDLSSSetOptions(viewport, options);
+    LOG_INFO("MetalFX slDLSSSetOptions result {0}", (int) result);
+    return result;
+}
+
+sl::Result StreamlineHooks::hkdlss_slDLSSGetState(const sl::ViewportHandle& viewport, sl::DLSSState& state)
+{
+    static int logged = 0;
+    const bool logThis = logged < 8;
+    if (logThis)
+    {
+        logged++;
+        LOG_INFO("MetalFX slDLSSGetState entry viewport {0}", (uint32_t) viewport);
+    }
+    if (o_dlss_slDLSSGetState == nullptr)
+    {
+        LOG_ERROR("MetalFX slDLSSGetState original missing");
+        return sl::Result::eErrorMissingOrInvalidAPI;
+    }
+    auto result = o_dlss_slDLSSGetState(viewport, state);
+    if (logThis)
+        LOG_INFO("MetalFX slDLSSGetState result {0}", (int) result);
+    return result;
+}
+
+sl::Result StreamlineHooks::hkcommon_slEvaluateFeature(sl::Feature feature, const sl::FrameToken& frame,
+                                                       const sl::BaseStructure** inputs, uint32_t numInputs,
+                                                       sl::CommandBuffer* cmdBuffer)
+{
+    static int logged = 0;
+    const bool logThis = logged < 8 || (feature == sl::kFeatureDLSS && logged < 24);
+    if (logThis)
+    {
+        logged++;
+        LOG_INFO("MetalFX sl.common slEvaluateFeature entry feature {0} frame {1} inputs {2}", (uint32_t) feature,
+                 static_cast<uint32_t>(frame), numInputs);
+    }
+    if (o_common_slEvaluateFeature == nullptr)
+    {
+        LOG_ERROR("MetalFX sl.common slEvaluateFeature original missing");
+        return sl::Result::eErrorMissingOrInvalidAPI;
+    }
+    auto result = o_common_slEvaluateFeature(feature, frame, inputs, numInputs, cmdBuffer);
+    if (logThis || result != sl::Result::eOk)
+        LOG_INFO("MetalFX sl.common slEvaluateFeature result feature {0}: {1}", (uint32_t) feature, (int) result);
     return result;
 }
 
@@ -828,6 +959,40 @@ void* StreamlineHooks::hkdlss_slGetPluginFunction(const char* functionName)
         return &hkslDLSSGetOptimalSettings;
     }
 
+    if (strcmp(functionName, "slDLSSSetOptions") == 0)
+    {
+        auto real = (decltype(&slDLSSSetOptions)) o_dlss_slGetPluginFunction(functionName);
+        if (real == nullptr)
+        {
+            LOG_WARN("MetalFX: sl.dlss slDLSSSetOptions is null");
+            return nullptr;
+        }
+        o_dlss_slDLSSSetOptions = real;
+        LOG_INFO("MetalFX: installed sl.dlss slDLSSSetOptions wrapper at {0:X}", (uint64_t) real);
+        return (void*) &hkdlss_slDLSSSetOptions;
+    }
+
+    if (strcmp(functionName, "slDLSSGetState") == 0)
+    {
+        auto real = (decltype(&slDLSSGetState)) o_dlss_slGetPluginFunction(functionName);
+        if (real == nullptr)
+        {
+            LOG_WARN("MetalFX: sl.dlss slDLSSGetState is null");
+            return nullptr;
+        }
+        o_dlss_slDLSSGetState = real;
+        LOG_INFO("MetalFX: installed sl.dlss slDLSSGetState wrapper at {0:X}", (uint64_t) real);
+        return (void*) &hkdlss_slDLSSGetState;
+    }
+
+    if (strcmp(functionName, "slEvaluateFeature") == 0)
+    {
+        auto real = o_dlss_slGetPluginFunction(functionName);
+        if (real == nullptr)
+            LOG_INFO("MetalFX: sl.dlss slEvaluateFeature is null; Witcher evaluate goes through sl.common");
+        return real;
+    }
+
     if (strcmp(functionName, "slAllocateResources") == 0)
     {
         auto real = (PFun_slAllocateResources*) o_dlss_slGetPluginFunction(functionName);
@@ -1072,6 +1237,21 @@ void* StreamlineHooks::hkcommon_slGetPluginFunction(const char* functionName)
         return &hkcommon_slSetParameters_sl1;
     }
 
+    // Witcher does not call slAllocateResources. sl.common is the module that
+    // imports NVSDK_NGX_D3D12_CreateFeature and runs the real evaluate.
+    if (strcmp(functionName, "slEvaluateFeature") == 0)
+    {
+        auto real = (decltype(&slEvaluateFeature)) o_common_slGetPluginFunction(functionName);
+        if (real == nullptr)
+        {
+            LOG_WARN("MetalFX: sl.common slEvaluateFeature is null");
+            return nullptr;
+        }
+        o_common_slEvaluateFeature = real;
+        LOG_INFO("MetalFX: installed sl.common slEvaluateFeature wrapper at {0:X}", (uint64_t) real);
+        return (void*) &hkcommon_slEvaluateFeature;
+    }
+
     return o_common_slGetPluginFunction(functionName);
 }
 
@@ -1110,6 +1290,12 @@ void StreamlineHooks::unhookInterposer()
     if (o_slInit)
         DetourDetach(&(PVOID&) o_slInit, hkslInit);
 
+    if (o_slGetFeatureFunction)
+        DetourDetach(&(PVOID&) o_slGetFeatureFunction, hkslGetFeatureFunction);
+
+    if (o_slIsFeatureSupported)
+        DetourDetach(&(PVOID&) o_slIsFeatureSupported, hkslIsFeatureSupported);
+
     if (o_slInit_sl1)
         DetourDetach(&(PVOID&) o_slInit_sl1, hkslInit_sl1);
 
@@ -1128,6 +1314,8 @@ void StreamlineHooks::unhookInterposer()
         o_slInit = nullptr;
         o_slInit_sl1 = nullptr;
         o_slSetTag = nullptr;
+        o_slGetFeatureFunction = nullptr;
+        o_slIsFeatureSupported = nullptr;
         o_logCallback = nullptr;
         o_logCallback_sl1 = nullptr;
     }
@@ -1193,6 +1381,10 @@ void StreamlineHooks::hookInterposer(HMODULE slInterposer)
                 KernelBaseProxy::GetProcAddress_()(slInterposer, "slSetD3DDevice"));
             o_slGetNewFrameToken = reinterpret_cast<decltype(&slGetNewFrameToken)>(
                 KernelBaseProxy::GetProcAddress_()(slInterposer, "slGetNewFrameToken")); // Not hooked
+            o_slGetFeatureFunction = reinterpret_cast<decltype(&slGetFeatureFunction)>(
+                KernelBaseProxy::GetProcAddress_()(slInterposer, "slGetFeatureFunction"));
+            o_slIsFeatureSupported = reinterpret_cast<decltype(&slIsFeatureSupported)>(
+                KernelBaseProxy::GetProcAddress_()(slInterposer, "slIsFeatureSupported"));
 
             if (o_slInit != nullptr)
             {
@@ -1225,6 +1417,22 @@ void StreamlineHooks::hookInterposer(HMODULE slInterposer)
                 else
                     LOG_WARN("MetalFX: sl.interposer slAllocateResources export missing");
 
+                if (o_slGetFeatureFunction != nullptr)
+                {
+                    DetourAttach(&(PVOID&) o_slGetFeatureFunction, hkslGetFeatureFunction);
+                    LOG_INFO("MetalFX: detoured slGetFeatureFunction");
+                }
+                else
+                    LOG_WARN("MetalFX: slGetFeatureFunction export missing");
+
+                if (o_slIsFeatureSupported != nullptr)
+                {
+                    DetourAttach(&(PVOID&) o_slIsFeatureSupported, hkslIsFeatureSupported);
+                    LOG_INFO("MetalFX: detoured slIsFeatureSupported");
+                }
+                else
+                    LOG_WARN("MetalFX: slIsFeatureSupported export missing");
+
                 // if (o_slGetNativeInterface != nullptr)
                 //     DetourAttach(&(PVOID&) o_slGetNativeInterface, hkslGetNativeInterface);
 
@@ -1243,6 +1451,8 @@ void StreamlineHooks::hookInterposer(HMODULE slInterposer)
                     o_slSetConstants = nullptr;
                     o_slGetNativeInterface = nullptr;
                     o_slSetD3DDevice = nullptr;
+                    o_slGetFeatureFunction = nullptr;
+                    o_slIsFeatureSupported = nullptr;
                 }
             }
         }
