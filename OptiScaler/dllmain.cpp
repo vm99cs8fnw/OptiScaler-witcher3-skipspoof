@@ -2030,11 +2030,21 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
                 // if (!Config::Instance()->StreamlineSpoofing.has_value())
                 //    Config::Instance()->StreamlineSpoofing.set_volatile_value(false);
             }
+            else if (Config::Instance()->NgxDlssPassthrough())
+            {
+                spdlog::warn("Not running on Nvidia, keeping DLSS for NGX passthrough (original nvngx)");
+                Config::Instance()->DLSSEnabled.set_volatile_value(true);
+            }
             else
             {
                 spdlog::info("Not running on Nvidia, disabling DLSS");
                 Config::Instance()->DLSSEnabled.set_volatile_value(false);
             }
+        }
+        else if (Config::Instance()->NgxDlssPassthrough())
+        {
+            spdlog::warn("DLSS.Enabled is false but passthrough requested, enabling original nvngx");
+            Config::Instance()->DLSSEnabled.set_volatile_value(true);
         }
         else
         {

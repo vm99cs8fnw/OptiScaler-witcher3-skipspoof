@@ -218,6 +218,9 @@ class Config
 
     // DLSS
     CustomOptional<bool> DLSSEnabled { true };
+    // Forward NGX CreateFeature/Evaluate to the original nvngx (Apple MetalFX / system nvngx)
+    // instead of replacing Super Sampling with FSR/XeSS. Also implied by Dx12Upscaler=dlss.
+    CustomOptional<bool> NGXPassThrough { false };
     CustomOptional<bool> RenderPresetOverride { false };
     CustomOptional<uint32_t> RenderPresetForAll { 0 };
     CustomOptional<uint32_t> RenderPresetDLAA { 0 };
@@ -591,6 +594,15 @@ class Config
     CustomOptional<bool> OverrideVsync { false };
     CustomOptional<bool, NoDefault> ForceVsync;
     CustomOptional<UINT> VsyncInterval { 0 };
+
+    // True when DLSS.PassThrough is set, or Dx12Upscaler is dlss.
+    // Keeps original nvngx init on non-NVIDIA (CrossOver/MetalFX) instead of disabling DLSS.
+    bool NgxDlssPassthrough()
+    {
+        if (NGXPassThrough.value_or_default())
+            return true;
+        return Dx12Upscaler.value_or_default() == "dlss";
+    }
 
     bool LoadFromPath(const wchar_t* InPath);
     bool SaveIni();

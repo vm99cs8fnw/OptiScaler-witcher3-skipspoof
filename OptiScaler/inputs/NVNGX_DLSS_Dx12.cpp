@@ -46,6 +46,21 @@ class ScopedInitDx12
     ~ScopedInitDx12() { _skipInit = previousState; }
 };
 
+static bool NgxPassthrough() { return Config::Instance()->NgxDlssPassthrough(); }
+
+// Call original nvngx with re-entry suppressed. Apple/system nvngx may LoadLibrary("nvngx.dll"),
+// which Opti answers with itself when EnableDlssInputs is on.
+static NVSDK_NGX_Result CallOriginalInitExt(unsigned long long InApplicationId, const wchar_t* InApplicationDataPath,
+                                             ID3D12Device* InDevice, NVSDK_NGX_Version InSDKVersion,
+                                             NVSDK_NGX_FeatureCommonInfo* featureInfo)
+{
+    ScopedInitDx12 scopedInit {};
+    LOG_INFO("NGX passthrough/original D3D12_Init_Ext");
+    auto result = NVNGXProxy::D3D12_Init_Ext()(InApplicationId, InApplicationDataPath, InDevice, InSDKVersion, featureInfo);
+    LOG_INFO("original D3D12_Init_Ext result: {0:X}", (UINT) result);
+    return result;
+}
+
 static void UpdateInitPaths(NVSDK_NGX_FeatureCommonInfo* InFeatureInfo)
 {
     State::Instance().NVNGX_FeatureInfo_Paths.clear();
@@ -177,8 +192,8 @@ NVSDK_NGX_API NVSDK_NGX_Result NVSDK_NGX_D3D12_Init_Ext(unsigned long long InApp
         {
             LOG_INFO("calling NVNGXProxy::D3D12_Init_Ext");
 
-            auto result = NVNGXProxy::D3D12_Init_Ext()(InApplicationId, InApplicationDataPath, InDevice, InSDKVersion,
-                                                       &localFeatureInfo);
+            auto result = CallOriginalInitExt(InApplicationId, InApplicationDataPath, InDevice, InSDKVersion,
+                                               &localFeatureInfo);
             LOG_INFO("calling NVNGXProxy::D3D12_Init_Ext result: {0:X}", (UINT) result);
 
             if (result == NVSDK_NGX_Result_Success)
@@ -460,7 +475,15 @@ NVSDK_NGX_API NVSDK_NGX_Result NVSDK_NGX_D3D12_GetParameters(NVSDK_NGX_Parameter
 
         if (result == NVSDK_NGX_Result_Success)
         {
-            InitNGXParameters(*OutParameters);
+            if (NgxPassthrough())
+            {
+                LOG_INFO("NGX passthrough: original GetParameters, not replacing callback or parameter map");
+                (*OutParameters)->Set(NVSDK_NGX_Parameter_SuperSampling_Available, 1);
+            }
+            else
+            {
+                InitNGXParameters(*OutParameters);
+            }
             return NVSDK_NGX_Result_Success;
         }
     }
@@ -489,10 +512,22 @@ NVSDK_NGX_API NVSDK_NGX_Result NVSDK_NGX_D3D12_GetCapabilityParameters(NVSDK_NGX
 
         if (result == NVSDK_NGX_Result_Success)
         {
-            InitNGXParameters(*OutParameters);
+            if (NgxPassthrough())
+            {
+                LOG_INFO("NGX passthrough: original GetCapabilityParameters, not replacing callback or parameter map");
+                (*OutParameters)->Set(NVSDK_NGX_Parameter_SuperSampling_Available, 1);
+                (*OutParameters)->Set(NVSDK_NGX_EParameter_SuperSampling_Available, 1);
+            }
+            else
+            {
+                InitNGXParameters(*OutParameters);
+            }
             return NVSDK_NGX_Result_Success;
         }
     }
+
+    if (NgxPassthrough())
+        LOG_WARN("NGX passthrough: original GetCapabilityParameters unavailable, using Opti parameters");
 
     *OutParameters = GetNGXParameters("OptiDx12");
 
@@ -531,7 +566,10 @@ NVSDK_NGX_API NVSDK_NGX_Result NVSDK_NGX_D3D12_PopulateParameters_Impl(NVSDK_NGX
     if (InParameters == nullptr)
         return NVSDK_NGX_Result_Fail;
 
-    InitNGXParameters(InParameters);
+    if (NgxPassthrough())
+        LOG_DEBUG("NGX passthrough: skip PopulateParameters overwrite");
+    else
+        InitNGXParameters(InParameters);
 
     if (State::Instance().activeFgInput == FGInput::Nukems)
         DLSSGMod::D3D12_PopulateParameters_Impl(InParameters);
@@ -603,6 +641,39 @@ NVSDK_NGX_API NVSDK_NGX_Result NVSDK_NGX_D3D12_CreateFeature(ID3D12GraphicsComma
             LOG_ERROR("Can't create this feature ({0})!", (int) InFeatureID);
             return NVSDK_NGX_Result_FAIL_FeatureNotSupported;
         }
+    }
+
+    // DLSS / MetalFX passthrough: do not build an FSR/XeSS feature. Original nvngx owns the handle.
+    if (NgxPassthrough() &&
+        (InFeatureID == NVSDK_NGX_Feature_SuperSampling || InFeatureID == NVSDK_NGX_Feature_RayReconstruction))
+    {
+        LOG_INFO("NGX passthrough D3D12_CreateFeature ({0})", (int) InFeatureID);
+
+        if (!D3D12Device && InCmdList != nullptr)
+        {
+            auto deviceResult = InCmdList->GetDevice(IID_PPV_ARGS(&D3D12Device));
+            if (deviceResult != S_OK)
+                LOG_WARN("passthrough GetDevice failed: {0:X}", (UINT) deviceResult);
+        }
+
+        if (NVNGXProxy::NVNGXModule() == nullptr)
+            NVNGXProxy::InitNVNGX();
+
+        if (!NVNGXProxy::IsDx12Inited() && D3D12Device != nullptr)
+            NVNGXProxy::InitDx12(D3D12Device);
+
+        if (Config::Instance()->DLSSEnabled.value_or_default() && NVNGXProxy::D3D12_CreateFeature() != nullptr)
+        {
+            auto result = NVNGXProxy::D3D12_CreateFeature()(InCmdList, InFeatureID, InParameters, OutHandle);
+            if (result == NVSDK_NGX_Result_Success && OutHandle != nullptr && *OutHandle != nullptr)
+                LOG_INFO("passthrough D3D12_CreateFeature ok id {0}", (*OutHandle)->Id);
+            else
+                LOG_WARN("passthrough D3D12_CreateFeature result: {0:X}", (UINT) result);
+            return result;
+        }
+
+        LOG_ERROR("passthrough D3D12_CreateFeature unavailable");
+        return NVSDK_NGX_Result_FAIL_FeatureNotSupported;
     }
 
     // Create feature
@@ -837,6 +908,8 @@ NVSDK_NGX_API NVSDK_NGX_Result NVSDK_NGX_D3D12_EvaluateFeature(ID3D12GraphicsCom
     {
         if (Config::Instance()->DLSSEnabled.value_or_default() && NVNGXProxy::D3D12_EvaluateFeature() != nullptr)
         {
+            if (NgxPassthrough())
+                LOG_INFO("NGX passthrough D3D12_EvaluateFeature ({0})", handleId);
             LOG_DEBUG("D3D12_EvaluateFeature for ({0})", handleId);
             auto result = NVNGXProxy::D3D12_EvaluateFeature()(InCmdList, InFeatureHandle, InParameters, InCallback);
             LOG_DEBUG("D3D12_EvaluateFeature result for ({0}): {1:X}", handleId, (UINT) result);
