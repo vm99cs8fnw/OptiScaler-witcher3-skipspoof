@@ -706,8 +706,12 @@ static void hookAdvapi32()
 
     if (Config::Instance()->SpoofHAGS.value_or_default() || Config::Instance()->SpoofRegistry.value_or_default())
     {
-        o_RegQueryValueExW =
-            reinterpret_cast<PFN_RegQueryValueExW>(DetourFindFunction("Advapi32.dll", "RegQueryValueExW"));
+        // RegQueryValueExW is left unhooked. Witcher calls SetupDiGetClassDevsW
+        // while a job-pool lock is held; the detour's call to the original never
+        // returned from ZwQueryValueKey, and the pool spun. ANSI queries still
+        // go through hkRegQueryValueExA. DXGI adapter spoof is unchanged.
+        LOG_WARN("RegQueryValueExW left unhooked");
+        (void) &hkRegQueryValueExW;
         o_RegQueryValueExA =
             reinterpret_cast<PFN_RegQueryValueExA>(DetourFindFunction("Advapi32.dll", "RegQueryValueExA"));
     }
@@ -723,9 +727,6 @@ static void hookAdvapi32()
 
     if (o_RegCloseKey)
         DetourAttach(&(PVOID&) o_RegCloseKey, hkRegCloseKey);
-
-    if (o_RegQueryValueExW)
-        DetourAttach(&(PVOID&) o_RegQueryValueExW, hkRegQueryValueExW);
 
     if (o_RegQueryValueExA)
         DetourAttach(&(PVOID&) o_RegQueryValueExA, hkRegQueryValueExA);
