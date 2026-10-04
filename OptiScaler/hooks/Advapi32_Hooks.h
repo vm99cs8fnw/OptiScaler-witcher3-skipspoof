@@ -284,8 +284,10 @@ static BOOLEAN WINAPI hkHidD_GetAttributes(HANDLE HidDeviceObject, OPTI_HIDD_ATT
         return FALSE;
 
     Attributes->Size = 12;
-    Attributes->VendorID = 0x045E;
-    Attributes->ProductID = 0x028E;
+    // Witcher only accepts Sony 0x054C + DualShock 4 0x05C4 (or 0x09CC)
+    // once VersionNumber decodes as BCD >= 0x17. 0x0100 decodes to 100.
+    Attributes->VendorID = 0x054C;
+    Attributes->ProductID = 0x05C4;
     Attributes->VersionNumber = 0x0100;
 
     static bool logged = false;
