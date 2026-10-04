@@ -65,6 +65,10 @@ class StreamlineHooks
     typedef bool (*PFN_slSetConstants_sl1)(const void* data, uint32_t frameIndex, uint32_t id);
     typedef void (*PFN_slSetParameters_sl1)(void* params);
     typedef bool (*PFN_setVoid)(void* self, const char* key, void** value);
+    // sl.interposer Parameters::set/get(int). Not IParameters in parameters.h:
+    // Witcher sl.dlss_g updateStatus calls vtable +0x10 / +0x48.
+    typedef void (*PFN_setIntParam)(void* self, const char* key, int value);
+    typedef bool (*PFN_getIntParam)(void* self, const char* key, int* value);
 
     static void updateForceReflex();
 
@@ -215,6 +219,14 @@ class StreamlineHooks
     static void hkcommon_slSetParameters_sl1(void* params);
     static bool hk_setVoid(void* self, const char* key, void** value);
 
+    // DLSS-G present compares sl.param.latency.frame to the finished frame id it
+    // stores in sl.param.reserved.frame. sl.reflex leaves the latency id at -1
+    // when no PCL present marker is published.
+    static PFN_setIntParam o_paramSetInt;
+    static PFN_getIntParam o_paramGetInt;
+    static void hookLatencyFrameParam(sl::param::IParameters* params);
+    static void hk_paramSetInt(void* self, const char* key, int value);
+
     // Logging
     static char* trimStreamlineLog(const char* msg);
     static void streamlineLogCallback(sl::LogType type, const char* msg);
@@ -254,4 +266,5 @@ class StreamlineHooks
     VALIDATE_MEMBER_HOOK(hkcommon_slEvaluateFeature, decltype(&slEvaluateFeature))
     VALIDATE_MEMBER_HOOK(hkcommon_slSetParameters_sl1, PFN_slSetParameters_sl1)
     VALIDATE_MEMBER_HOOK(hk_setVoid, PFN_setVoid)
+    VALIDATE_MEMBER_HOOK(hk_paramSetInt, PFN_setIntParam)
 };

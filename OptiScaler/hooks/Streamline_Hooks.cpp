@@ -69,6 +69,8 @@ StreamlineHooks::PFN_slGetPluginFunction StreamlineHooks::o_common_slGetPluginFu
 StreamlineHooks::PFN_slOnPluginLoad StreamlineHooks::o_common_slOnPluginLoad = nullptr;
 StreamlineHooks::PFN_slSetParameters_sl1 StreamlineHooks::o_common_slSetParameters_sl1 = nullptr;
 StreamlineHooks::PFN_setVoid StreamlineHooks::o_setVoid = nullptr;
+StreamlineHooks::PFN_setIntParam StreamlineHooks::o_paramSetInt = nullptr;
+StreamlineHooks::PFN_getIntParam StreamlineHooks::o_paramGetInt = nullptr;
 decltype(&slEvaluateFeature) StreamlineHooks::o_common_slEvaluateFeature = nullptr;
 
 char* StreamlineHooks::trimStreamlineLog(const char* msg)
@@ -942,7 +944,10 @@ bool StreamlineHooks::hkdlssg_slOnPluginLoad(sl::param::IParameters* params, con
     if (metalFxDlssg || shouldSpoofArch)
         hookSystemCaps(params);
     if (metalFxDlssg)
+    {
+        hookLatencyFrameParam(params);
         metalFxCaps.arm();
+    }
     else if (shouldSpoofArch)
     {
         currentArch = getSystemCapsArch();
@@ -1517,6 +1522,65 @@ bool StreamlineHooks::hk_setVoid(void* self, const char* key, void** value)
     }
 
     return o_setVoid(self, key, value);
+}
+
+void StreamlineHooks::hookLatencyFrameParam(sl::param::IParameters* params)
+{
+    if (o_paramSetInt != nullptr || params == nullptr)
+        return;
+
+    // Confirmed in the game's sl.dlss_g (dlfgPresent.cpp updateStatus) and sl.interposer
+    // Parameters vtable: set(const char*, int) is slot 2, get(const char*, int*) is slot 9.
+    // parameters.h's IParameters order does not match this interposer, so do not call it.
+    void** vtable = *reinterpret_cast<void***>(params);
+    if (vtable == nullptr || vtable[2] == nullptr || vtable[9] == nullptr)
+    {
+        LOG_ERROR("MetalFX: latency frame param vtable missing");
+        return;
+    }
+
+    o_paramSetInt = (PFN_setIntParam) vtable[2];
+    o_paramGetInt = (PFN_getIntParam) vtable[9];
+
+    DetourTransactionBegin();
+    DetourUpdateThread(GetCurrentThread());
+    DetourAttach(&(PVOID&) o_paramSetInt, hk_paramSetInt);
+    auto detourResult = DetourTransactionCommit();
+    if (detourResult != NO_ERROR)
+    {
+        LOG_ERROR("MetalFX: failed to hook latency frame param set: {:X}", detourResult);
+        o_paramSetInt = nullptr;
+        o_paramGetInt = nullptr;
+    }
+}
+
+void StreamlineHooks::hk_paramSetInt(void* self, const char* key, int value)
+{
+    o_paramSetInt(self, key, value);
+
+    if (!Config::Instance()->NgxDlssPassthrough() || key == nullptr || o_paramGetInt == nullptr)
+        return;
+    if (strcmp(key, sl::param::dlss_g::kCurrentFrame) != 0)
+        return;
+
+    // dlfgPresent.cpp updateStatus: reflex id (default -1) must equal the finished
+    // frame id just written to sl.param.reserved.frame.
+    int latencyFrame = -1;
+    bool found = o_paramGetInt(self, sl::param::latency::kCurrentFrame, &latencyFrame);
+    if (found && latencyFrame == value)
+        return;
+
+    o_paramSetInt(self, sl::param::latency::kCurrentFrame, value);
+
+    if (!found || latencyFrame == -1)
+    {
+        static bool logged = false;
+        if (!logged)
+        {
+            logged = true;
+            LOG_INFO("MetalFX: injected sl.reflex PCL frame id {0} (sl.param.latency.frame was -1)", value);
+        }
+    }
 }
 
 void StreamlineHooks::hkcommon_slSetParameters_sl1(void* params)
