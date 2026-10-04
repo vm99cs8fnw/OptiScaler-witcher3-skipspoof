@@ -19,6 +19,50 @@ static PFN_RegCloseKey o_RegCloseKey = nullptr;
 static PFN_RegQueryValueExW o_RegQueryValueExW = nullptr;
 static PFN_RegQueryValueExA o_RegQueryValueExA = nullptr;
 
+// Wine's SetupDiGetClassDevsExW never returns from RegEnumKeyExW/ZwEnumerateKey
+// for Flags 0x12 (DIGCF_PRESENT|DIGCF_DEVICEINTERFACE) and a null enumerator.
+// Witcher holds a job-pool lock across that call. Do not call the original.
+typedef PVOID OPTI_HDEVINFO;
+typedef OPTI_HDEVINFO(WINAPI* PFN_SetupDiGetClassDevsW)(const GUID*, PCWSTR, HWND, DWORD);
+typedef OPTI_HDEVINFO(WINAPI* PFN_SetupDiGetClassDevsExW)(const GUID*, PCWSTR, HWND, DWORD, OPTI_HDEVINFO, PCWSTR,
+                                                          PVOID);
+static PFN_SetupDiGetClassDevsW o_SetupDiGetClassDevsW = nullptr;
+static PFN_SetupDiGetClassDevsExW o_SetupDiGetClassDevsExW = nullptr;
+
+static bool ShortCircuitSetupDi(DWORD Flags, PCWSTR Enumerator)
+{
+    if (Flags != 0x12 || Enumerator != nullptr)
+        return false;
+
+    static bool logged = false;
+    if (!logged)
+    {
+        logged = true;
+        LOG_WARN("SetupDiGetClassDevs short-circuited");
+    }
+
+    return true;
+}
+
+static OPTI_HDEVINFO WINAPI hkSetupDiGetClassDevsW(const GUID* ClassGuid, PCWSTR Enumerator, HWND hwndParent, DWORD Flags)
+{
+    if (ShortCircuitSetupDi(Flags, Enumerator))
+        return reinterpret_cast<OPTI_HDEVINFO>(INVALID_HANDLE_VALUE);
+
+    return o_SetupDiGetClassDevsW(ClassGuid, Enumerator, hwndParent, Flags);
+}
+
+static OPTI_HDEVINFO WINAPI hkSetupDiGetClassDevsExW(const GUID* ClassGuid, PCWSTR Enumerator, HWND hwndParent,
+                                                     DWORD Flags, OPTI_HDEVINFO DeviceInfoSet, PCWSTR MachineName,
+                                                     PVOID Reserved)
+{
+    if (ShortCircuitSetupDi(Flags, Enumerator))
+        return reinterpret_cast<OPTI_HDEVINFO>(INVALID_HANDLE_VALUE);
+
+    return o_SetupDiGetClassDevsExW(ClassGuid, Enumerator, hwndParent, Flags, DeviceInfoSet, MachineName, Reserved);
+}
+
+
 VALIDATE_HOOK(hkRegOpenKeyExW, PFN_RegOpenKeyExW)
 static LSTATUS hkRegOpenKeyExW(HKEY hKey, LPCWSTR lpSubKey, DWORD ulOptions, REGSAM samDesired, PHKEY phkResult)
 {
@@ -704,6 +748,12 @@ static void hookAdvapi32()
     o_RegEnumValueW = reinterpret_cast<PFN_RegEnumValueW>(DetourFindFunction("Advapi32.dll", "RegEnumValueW"));
     o_RegCloseKey = reinterpret_cast<PFN_RegCloseKey>(DetourFindFunction("Advapi32.dll", "RegCloseKey"));
 
+    LoadLibraryW(L"setupapi.dll");
+    o_SetupDiGetClassDevsW =
+        reinterpret_cast<PFN_SetupDiGetClassDevsW>(DetourFindFunction("setupapi.dll", "SetupDiGetClassDevsW"));
+    o_SetupDiGetClassDevsExW =
+        reinterpret_cast<PFN_SetupDiGetClassDevsExW>(DetourFindFunction("setupapi.dll", "SetupDiGetClassDevsExW"));
+
     if (Config::Instance()->SpoofHAGS.value_or_default() || Config::Instance()->SpoofRegistry.value_or_default())
     {
         // RegQueryValueExW is left unhooked. Witcher calls SetupDiGetClassDevsW
@@ -731,6 +781,12 @@ static void hookAdvapi32()
     if (o_RegQueryValueExA)
         DetourAttach(&(PVOID&) o_RegQueryValueExA, hkRegQueryValueExA);
 
+    if (o_SetupDiGetClassDevsW)
+        DetourAttach(&(PVOID&) o_SetupDiGetClassDevsW, hkSetupDiGetClassDevsW);
+
+    if (o_SetupDiGetClassDevsExW)
+        DetourAttach(&(PVOID&) o_SetupDiGetClassDevsExW, hkSetupDiGetClassDevsExW);
+
     auto detourResult = DetourTransactionCommit();
     if (detourResult != NO_ERROR)
     {
@@ -740,6 +796,8 @@ static void hookAdvapi32()
         o_RegCloseKey = nullptr;
         o_RegQueryValueExW = nullptr;
         o_RegQueryValueExA = nullptr;
+        o_SetupDiGetClassDevsW = nullptr;
+        o_SetupDiGetClassDevsExW = nullptr;
     }
 }
 
@@ -763,6 +821,12 @@ static void unhookAdvapi32()
     if (o_RegQueryValueExA)
         DetourDetach(&(PVOID&) o_RegQueryValueExA, hkRegQueryValueExA);
 
+    if (o_SetupDiGetClassDevsW)
+        DetourDetach(&(PVOID&) o_SetupDiGetClassDevsW, hkSetupDiGetClassDevsW);
+
+    if (o_SetupDiGetClassDevsExW)
+        DetourDetach(&(PVOID&) o_SetupDiGetClassDevsExW, hkSetupDiGetClassDevsExW);
+
     auto detourResult = DetourTransactionCommit();
     if (detourResult != NO_ERROR)
     {
@@ -775,5 +839,7 @@ static void unhookAdvapi32()
         o_RegOpenKeyExW = nullptr;
         o_RegQueryValueExA = nullptr;
         o_RegQueryValueExW = nullptr;
+        o_SetupDiGetClassDevsW = nullptr;
+        o_SetupDiGetClassDevsExW = nullptr;
     }
 }
