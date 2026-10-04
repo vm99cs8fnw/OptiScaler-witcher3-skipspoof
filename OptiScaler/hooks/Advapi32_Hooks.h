@@ -186,6 +186,71 @@ static BOOL WINAPI hkSetupDiDestroyDeviceInfoList(OPTI_HDEVINFO DeviceInfoSet)
     return TRUE;
 }
 
+typedef HANDLE(WINAPI* PFN_CreateFileW)(LPCWSTR, DWORD, DWORD, LPSECURITY_ATTRIBUTES, DWORD, DWORD, HANDLE);
+static PFN_CreateFileW o_CreateFileW = nullptr;
+
+static bool IsNulDevicePath(LPCWSTR path)
+{
+    return path != nullptr && _wcsicmp(path, L"\\\\.\\NUL") == 0;
+}
+
+static HANDLE OpenEmptyStandIn(DWORD access, DWORD share, LPSECURITY_ATTRIBUTES security)
+{
+    wchar_t dir[MAX_PATH];
+    wchar_t file[MAX_PATH];
+    DWORD n = GetTempPathW(MAX_PATH, dir);
+    if (n == 0 || n >= MAX_PATH)
+        return INVALID_HANDLE_VALUE;
+    if (GetTempFileNameW(dir, L"OSN", 0, file) == 0)
+        return INVALID_HANDLE_VALUE;
+    // GetTempFileNameW already created the file. Open it without overlapped I/O.
+    return o_CreateFileW(file, access, share, security, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+}
+
+static HANDLE WINAPI hkCreateFileW(LPCWSTR lpFileName, DWORD dwDesiredAccess, DWORD dwShareMode,
+                                   LPSECURITY_ATTRIBUTES lpSecurityAttributes, DWORD dwCreationDisposition,
+                                   DWORD dwFlagsAndAttributes, HANDLE hTemplateFile)
+{
+    if (!IsNulDevicePath(lpFileName))
+        return o_CreateFileW(lpFileName, dwDesiredAccess, dwShareMode, lpSecurityAttributes, dwCreationDisposition,
+                              dwFlagsAndAttributes, hTemplateFile);
+
+    DWORD flags = dwFlagsAndAttributes & ~FILE_FLAG_OVERLAPPED;
+    HANDLE handle = o_CreateFileW(lpFileName, dwDesiredAccess, dwShareMode, lpSecurityAttributes, dwCreationDisposition,
+                                  flags, hTemplateFile);
+    if (handle != INVALID_HANDLE_VALUE)
+    {
+        static bool logged = false;
+        if (!logged)
+        {
+            logged = true;
+            LOG_WARN("CreateFileW NUL without overlapped");
+        }
+        return handle;
+    }
+
+    handle = OpenEmptyStandIn(dwDesiredAccess, dwShareMode, lpSecurityAttributes);
+    if (handle != INVALID_HANDLE_VALUE)
+    {
+        static bool logged = false;
+        if (!logged)
+        {
+            logged = true;
+            LOG_WARN("CreateFileW NUL empty file");
+        }
+        return handle;
+    }
+
+    static bool logged = false;
+    if (!logged)
+    {
+        logged = true;
+        LOG_WARN("CreateFileW NUL failed");
+    }
+    return INVALID_HANDLE_VALUE;
+}
+
+
 VALIDATE_HOOK(hkRegOpenKeyExW, PFN_RegOpenKeyExW)
 static LSTATUS hkRegOpenKeyExW(HKEY hKey, LPCWSTR lpSubKey, DWORD ulOptions, REGSAM samDesired, PHKEY phkResult)
 {
@@ -882,6 +947,7 @@ static void hookAdvapi32()
         DetourFindFunction("setupapi.dll", "SetupDiGetDeviceInterfaceDetailW"));
     o_SetupDiDestroyDeviceInfoList = reinterpret_cast<PFN_SetupDiDestroyDeviceInfoList>(
         DetourFindFunction("setupapi.dll", "SetupDiDestroyDeviceInfoList"));
+    o_CreateFileW = reinterpret_cast<PFN_CreateFileW>(DetourFindFunction("kernel32.dll", "CreateFileW"));
 
     if (Config::Instance()->SpoofHAGS.value_or_default() || Config::Instance()->SpoofRegistry.value_or_default())
     {
@@ -925,6 +991,9 @@ static void hookAdvapi32()
     if (o_SetupDiDestroyDeviceInfoList)
         DetourAttach(&(PVOID&) o_SetupDiDestroyDeviceInfoList, hkSetupDiDestroyDeviceInfoList);
 
+    if (o_CreateFileW)
+        DetourAttach(&(PVOID&) o_CreateFileW, hkCreateFileW);
+
     auto detourResult = DetourTransactionCommit();
     if (detourResult != NO_ERROR)
     {
@@ -939,6 +1008,7 @@ static void hookAdvapi32()
         o_SetupDiEnumDeviceInterfaces = nullptr;
         o_SetupDiGetDeviceInterfaceDetailW = nullptr;
         o_SetupDiDestroyDeviceInfoList = nullptr;
+        o_CreateFileW = nullptr;
     }
 }
 
@@ -977,6 +1047,9 @@ static void unhookAdvapi32()
     if (o_SetupDiDestroyDeviceInfoList)
         DetourDetach(&(PVOID&) o_SetupDiDestroyDeviceInfoList, hkSetupDiDestroyDeviceInfoList);
 
+    if (o_CreateFileW)
+        DetourDetach(&(PVOID&) o_CreateFileW, hkCreateFileW);
+
     auto detourResult = DetourTransactionCommit();
     if (detourResult != NO_ERROR)
     {
@@ -994,5 +1067,6 @@ static void unhookAdvapi32()
         o_SetupDiEnumDeviceInterfaces = nullptr;
         o_SetupDiGetDeviceInterfaceDetailW = nullptr;
         o_SetupDiDestroyDeviceInfoList = nullptr;
+        o_CreateFileW = nullptr;
     }
 }
