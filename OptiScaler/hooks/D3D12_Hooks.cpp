@@ -1756,6 +1756,34 @@ static HRESULT hkCheckFeatureSupport(ID3D12Device* device, D3D12_FEATURE Feature
         featureSupport->AtomicInt64OnTypedResourceSupported = 1;
     }
 
+    // Witcher next-gen, Wine/D3DMetal, DXGI spoofed as RTX 4090:
+    // the load screen presents for ~50s while VRAM climbs to ~4GB, then a job
+    // thread spins in ShadeProbes (witcher3+0x1cf3aba SwitchToThread) waiting
+    // on the job id at global+0x108f4. The following scope in that function is
+    // BuildAccelerationStructures. No slDLSSSetOptions / CreateFeature / Evaluate
+    // is in that wait. D3DMetal can still report a raytracing tier; combined
+    // with the NVIDIA spoof the game starts an RT/probe job that never completes.
+    // DLSS/MetalFX does not need DXR. Report tier 0 on Wine.
+    if (State::Instance().isRunningOnLinux && SUCCEEDED(result) && pFeatureSupportData != nullptr &&
+        Feature == D3D12_FEATURE_D3D12_OPTIONS5 &&
+        FeatureSupportDataSize >= sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS5))
+    {
+        auto* opt5 = reinterpret_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS5*>(pFeatureSupportData);
+        static bool logged = false;
+        if (opt5->RaytracingTier != D3D12_RAYTRACING_TIER_NOT_SUPPORTED)
+        {
+            LOG_WARN("MetalFX: OPTIONS5 RaytracingTier {} -> NOT_SUPPORTED on Wine "
+                     "(avoid ShadeProbes/BuildAccelerationStructures job spin)",
+                     (int) opt5->RaytracingTier);
+            opt5->RaytracingTier = D3D12_RAYTRACING_TIER_NOT_SUPPORTED;
+        }
+        else if (!logged)
+        {
+            logged = true;
+            LOG_INFO("MetalFX: OPTIONS5 RaytracingTier already NOT_SUPPORTED");
+        }
+    }
+
     return result;
 }
 
