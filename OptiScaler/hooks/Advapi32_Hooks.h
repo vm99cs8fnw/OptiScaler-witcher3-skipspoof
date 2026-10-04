@@ -130,10 +130,11 @@ static BOOL WINAPI hkSetupDiGetDeviceInterfaceDetailW(OPTI_HDEVINFO DeviceInfoSe
         return o_SetupDiGetDeviceInterfaceDetailW(DeviceInfoSet, DeviceInterfaceData, DeviceInterfaceDetailData,
                                                    DeviceInterfaceDetailDataSize, RequiredSize, DeviceInfoData);
 
-    // \\.\NUL. CreateFileW has to succeed or Witcher sleeps 500ms and retries.
+    // Witcher reads DevicePath at offset 4 (add rbx, 4). cbSize stays whatever
+    // the caller wrote. \\.\NUL must sit at that offset or CreateFile retries.
     static const wchar_t kPath[] = L"\\\\.\\NUL";
     const DWORD pathBytes = static_cast<DWORD>(sizeof(kPath));
-    const DWORD needed = 8 + pathBytes;
+    const DWORD needed = 4 + pathBytes;
 
     if (RequiredSize != nullptr)
         *RequiredSize = needed;
@@ -145,7 +146,7 @@ static BOOL WINAPI hkSetupDiGetDeviceInterfaceDetailW(OPTI_HDEVINFO DeviceInfoSe
     }
 
     auto* bytes = reinterpret_cast<BYTE*>(DeviceInterfaceDetailData);
-    std::memcpy(bytes + 8, kPath, pathBytes);
+    std::memcpy(bytes + 4, kPath, pathBytes);
 
     if (DeviceInfoData != nullptr)
     {
@@ -164,7 +165,7 @@ static BOOL WINAPI hkSetupDiGetDeviceInterfaceDetailW(OPTI_HDEVINFO DeviceInfoSe
     if (!logged)
     {
         logged = true;
-        LOG_WARN("SetupDiGetDeviceInterfaceDetailW path NUL");
+        LOG_WARN("SetupDiGetDeviceInterfaceDetailW path NUL offset 4");
     }
     SetLastError(ERROR_SUCCESS);
     return TRUE;
