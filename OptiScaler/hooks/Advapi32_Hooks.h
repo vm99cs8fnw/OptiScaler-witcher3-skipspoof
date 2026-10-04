@@ -19,35 +19,47 @@ static PFN_RegCloseKey o_RegCloseKey = nullptr;
 static PFN_RegQueryValueExW o_RegQueryValueExW = nullptr;
 static PFN_RegQueryValueExA o_RegQueryValueExA = nullptr;
 
-// Wine's SetupDiGetClassDevsExW never returns from RegEnumKeyExW/ZwEnumerateKey
-// for Flags 0x12 (DIGCF_PRESENT|DIGCF_DEVICEINTERFACE) and a null enumerator.
-// Witcher holds a job-pool lock across that call. Do not call the original.
+// Wine never finishes SetupDiGetClassDevsW for Flags 0x12
+// (DIGCF_PRESENT|DIGCF_DEVICEINTERFACE) and a null enumerator. Returning
+// INVALID_HANDLE_VALUE makes Witcher Sleep(500) and retry while holding a
+// job-pool lock. Hand back a sentinel list with one openable interface.
 typedef PVOID OPTI_HDEVINFO;
 typedef OPTI_HDEVINFO(WINAPI* PFN_SetupDiGetClassDevsW)(const GUID*, PCWSTR, HWND, DWORD);
 typedef OPTI_HDEVINFO(WINAPI* PFN_SetupDiGetClassDevsExW)(const GUID*, PCWSTR, HWND, DWORD, OPTI_HDEVINFO, PCWSTR,
                                                           PVOID);
+typedef BOOL(WINAPI* PFN_SetupDiEnumDeviceInterfaces)(OPTI_HDEVINFO, PVOID, const GUID*, DWORD, PVOID);
+typedef BOOL(WINAPI* PFN_SetupDiGetDeviceInterfaceDetailW)(OPTI_HDEVINFO, PVOID, PVOID, DWORD, PDWORD, PVOID);
+typedef BOOL(WINAPI* PFN_SetupDiDestroyDeviceInfoList)(OPTI_HDEVINFO);
+
 static PFN_SetupDiGetClassDevsW o_SetupDiGetClassDevsW = nullptr;
 static PFN_SetupDiGetClassDevsExW o_SetupDiGetClassDevsExW = nullptr;
+static PFN_SetupDiEnumDeviceInterfaces o_SetupDiEnumDeviceInterfaces = nullptr;
+static PFN_SetupDiGetDeviceInterfaceDetailW o_SetupDiGetDeviceInterfaceDetailW = nullptr;
+static PFN_SetupDiDestroyDeviceInfoList o_SetupDiDestroyDeviceInfoList = nullptr;
 
-static bool ShortCircuitSetupDi(DWORD Flags, PCWSTR Enumerator)
+static int g_setupDiSentinel = 0;
+static OPTI_HDEVINFO SetupDiSentinel()
 {
-    if (Flags != 0x12 || Enumerator != nullptr)
-        return false;
+    return &g_setupDiSentinel;
+}
 
-    static bool logged = false;
-    if (!logged)
-    {
-        logged = true;
-        LOG_WARN("SetupDiGetClassDevs short-circuited");
-    }
-
-    return true;
+static bool IsSetupDiSentinelCase(DWORD Flags, PCWSTR Enumerator)
+{
+    return Flags == 0x12 && Enumerator == nullptr;
 }
 
 static OPTI_HDEVINFO WINAPI hkSetupDiGetClassDevsW(const GUID* ClassGuid, PCWSTR Enumerator, HWND hwndParent, DWORD Flags)
 {
-    if (ShortCircuitSetupDi(Flags, Enumerator))
-        return reinterpret_cast<OPTI_HDEVINFO>(INVALID_HANDLE_VALUE);
+    if (IsSetupDiSentinelCase(Flags, Enumerator))
+    {
+        static bool logged = false;
+        if (!logged)
+        {
+            logged = true;
+            LOG_WARN("SetupDi sentinel list");
+        }
+        return SetupDiSentinel();
+    }
 
     return o_SetupDiGetClassDevsW(ClassGuid, Enumerator, hwndParent, Flags);
 }
@@ -56,12 +68,122 @@ static OPTI_HDEVINFO WINAPI hkSetupDiGetClassDevsExW(const GUID* ClassGuid, PCWS
                                                      DWORD Flags, OPTI_HDEVINFO DeviceInfoSet, PCWSTR MachineName,
                                                      PVOID Reserved)
 {
-    if (ShortCircuitSetupDi(Flags, Enumerator))
-        return reinterpret_cast<OPTI_HDEVINFO>(INVALID_HANDLE_VALUE);
+    if (IsSetupDiSentinelCase(Flags, Enumerator))
+    {
+        static bool logged = false;
+        if (!logged)
+        {
+            logged = true;
+            LOG_WARN("SetupDi sentinel list");
+        }
+        return SetupDiSentinel();
+    }
 
     return o_SetupDiGetClassDevsExW(ClassGuid, Enumerator, hwndParent, Flags, DeviceInfoSet, MachineName, Reserved);
 }
 
+static BOOL WINAPI hkSetupDiEnumDeviceInterfaces(OPTI_HDEVINFO DeviceInfoSet, PVOID DeviceInfoData,
+                                                 const GUID* InterfaceClassGuid, DWORD MemberIndex,
+                                                 PVOID DeviceInterfaceData)
+{
+    if (DeviceInfoSet != SetupDiSentinel())
+        return o_SetupDiEnumDeviceInterfaces(DeviceInfoSet, DeviceInfoData, InterfaceClassGuid, MemberIndex,
+                                              DeviceInterfaceData);
+
+    if (MemberIndex != 0 || DeviceInterfaceData == nullptr)
+    {
+        SetLastError(MemberIndex != 0 ? ERROR_NO_MORE_ITEMS : ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+
+    auto* bytes = reinterpret_cast<BYTE*>(DeviceInterfaceData);
+    DWORD cbSize = *reinterpret_cast<DWORD*>(bytes);
+    if (cbSize < 28)
+    {
+        SetLastError(ERROR_INVALID_USER_BUFFER);
+        return FALSE;
+    }
+
+    if (InterfaceClassGuid != nullptr)
+        std::memcpy(bytes + 4, InterfaceClassGuid, sizeof(GUID));
+    else
+        std::memset(bytes + 4, 0, sizeof(GUID));
+    *reinterpret_cast<DWORD*>(bytes + 20) = 1; // SPINT_ACTIVE
+    if (cbSize >= 32)
+        *reinterpret_cast<ULONG_PTR*>(bytes + 24) = 0;
+
+    static bool logged = false;
+    if (!logged)
+    {
+        logged = true;
+        LOG_WARN("SetupDiEnumDeviceInterfaces index 0");
+    }
+    SetLastError(ERROR_SUCCESS);
+    return TRUE;
+}
+
+static BOOL WINAPI hkSetupDiGetDeviceInterfaceDetailW(OPTI_HDEVINFO DeviceInfoSet, PVOID DeviceInterfaceData,
+                                                      PVOID DeviceInterfaceDetailData, DWORD DeviceInterfaceDetailDataSize,
+                                                      PDWORD RequiredSize, PVOID DeviceInfoData)
+{
+    if (DeviceInfoSet != SetupDiSentinel())
+        return o_SetupDiGetDeviceInterfaceDetailW(DeviceInfoSet, DeviceInterfaceData, DeviceInterfaceDetailData,
+                                                   DeviceInterfaceDetailDataSize, RequiredSize, DeviceInfoData);
+
+    // \\.\NUL. CreateFileW has to succeed or Witcher sleeps 500ms and retries.
+    static const wchar_t kPath[] = L"\\\\.\\NUL";
+    const DWORD pathBytes = static_cast<DWORD>(sizeof(kPath));
+    const DWORD needed = 8 + pathBytes;
+
+    if (RequiredSize != nullptr)
+        *RequiredSize = needed;
+
+    if (DeviceInterfaceDetailData == nullptr || DeviceInterfaceDetailDataSize < needed)
+    {
+        SetLastError(ERROR_INSUFFICIENT_BUFFER);
+        return FALSE;
+    }
+
+    auto* bytes = reinterpret_cast<BYTE*>(DeviceInterfaceDetailData);
+    std::memcpy(bytes + 8, kPath, pathBytes);
+
+    if (DeviceInfoData != nullptr)
+    {
+        auto* info = reinterpret_cast<BYTE*>(DeviceInfoData);
+        DWORD infoSize = *reinterpret_cast<DWORD*>(info);
+        if (infoSize >= 28)
+        {
+            std::memset(info + 4, 0, sizeof(GUID));
+            *reinterpret_cast<DWORD*>(info + 20) = 0;
+            if (infoSize >= 32)
+                *reinterpret_cast<ULONG_PTR*>(info + 24) = 0;
+        }
+    }
+
+    static bool logged = false;
+    if (!logged)
+    {
+        logged = true;
+        LOG_WARN("SetupDiGetDeviceInterfaceDetailW path NUL");
+    }
+    SetLastError(ERROR_SUCCESS);
+    return TRUE;
+}
+
+static BOOL WINAPI hkSetupDiDestroyDeviceInfoList(OPTI_HDEVINFO DeviceInfoSet)
+{
+    if (DeviceInfoSet != SetupDiSentinel())
+        return o_SetupDiDestroyDeviceInfoList(DeviceInfoSet);
+
+    static bool logged = false;
+    if (!logged)
+    {
+        logged = true;
+        LOG_WARN("SetupDiDestroyDeviceInfoList sentinel");
+    }
+    SetLastError(ERROR_SUCCESS);
+    return TRUE;
+}
 
 VALIDATE_HOOK(hkRegOpenKeyExW, PFN_RegOpenKeyExW)
 static LSTATUS hkRegOpenKeyExW(HKEY hKey, LPCWSTR lpSubKey, DWORD ulOptions, REGSAM samDesired, PHKEY phkResult)
@@ -753,6 +875,12 @@ static void hookAdvapi32()
         reinterpret_cast<PFN_SetupDiGetClassDevsW>(DetourFindFunction("setupapi.dll", "SetupDiGetClassDevsW"));
     o_SetupDiGetClassDevsExW =
         reinterpret_cast<PFN_SetupDiGetClassDevsExW>(DetourFindFunction("setupapi.dll", "SetupDiGetClassDevsExW"));
+    o_SetupDiEnumDeviceInterfaces = reinterpret_cast<PFN_SetupDiEnumDeviceInterfaces>(
+        DetourFindFunction("setupapi.dll", "SetupDiEnumDeviceInterfaces"));
+    o_SetupDiGetDeviceInterfaceDetailW = reinterpret_cast<PFN_SetupDiGetDeviceInterfaceDetailW>(
+        DetourFindFunction("setupapi.dll", "SetupDiGetDeviceInterfaceDetailW"));
+    o_SetupDiDestroyDeviceInfoList = reinterpret_cast<PFN_SetupDiDestroyDeviceInfoList>(
+        DetourFindFunction("setupapi.dll", "SetupDiDestroyDeviceInfoList"));
 
     if (Config::Instance()->SpoofHAGS.value_or_default() || Config::Instance()->SpoofRegistry.value_or_default())
     {
@@ -787,6 +915,15 @@ static void hookAdvapi32()
     if (o_SetupDiGetClassDevsExW)
         DetourAttach(&(PVOID&) o_SetupDiGetClassDevsExW, hkSetupDiGetClassDevsExW);
 
+    if (o_SetupDiEnumDeviceInterfaces)
+        DetourAttach(&(PVOID&) o_SetupDiEnumDeviceInterfaces, hkSetupDiEnumDeviceInterfaces);
+
+    if (o_SetupDiGetDeviceInterfaceDetailW)
+        DetourAttach(&(PVOID&) o_SetupDiGetDeviceInterfaceDetailW, hkSetupDiGetDeviceInterfaceDetailW);
+
+    if (o_SetupDiDestroyDeviceInfoList)
+        DetourAttach(&(PVOID&) o_SetupDiDestroyDeviceInfoList, hkSetupDiDestroyDeviceInfoList);
+
     auto detourResult = DetourTransactionCommit();
     if (detourResult != NO_ERROR)
     {
@@ -798,6 +935,9 @@ static void hookAdvapi32()
         o_RegQueryValueExA = nullptr;
         o_SetupDiGetClassDevsW = nullptr;
         o_SetupDiGetClassDevsExW = nullptr;
+        o_SetupDiEnumDeviceInterfaces = nullptr;
+        o_SetupDiGetDeviceInterfaceDetailW = nullptr;
+        o_SetupDiDestroyDeviceInfoList = nullptr;
     }
 }
 
@@ -827,6 +967,15 @@ static void unhookAdvapi32()
     if (o_SetupDiGetClassDevsExW)
         DetourDetach(&(PVOID&) o_SetupDiGetClassDevsExW, hkSetupDiGetClassDevsExW);
 
+    if (o_SetupDiEnumDeviceInterfaces)
+        DetourDetach(&(PVOID&) o_SetupDiEnumDeviceInterfaces, hkSetupDiEnumDeviceInterfaces);
+
+    if (o_SetupDiGetDeviceInterfaceDetailW)
+        DetourDetach(&(PVOID&) o_SetupDiGetDeviceInterfaceDetailW, hkSetupDiGetDeviceInterfaceDetailW);
+
+    if (o_SetupDiDestroyDeviceInfoList)
+        DetourDetach(&(PVOID&) o_SetupDiDestroyDeviceInfoList, hkSetupDiDestroyDeviceInfoList);
+
     auto detourResult = DetourTransactionCommit();
     if (detourResult != NO_ERROR)
     {
@@ -841,5 +990,8 @@ static void unhookAdvapi32()
         o_RegQueryValueExW = nullptr;
         o_SetupDiGetClassDevsW = nullptr;
         o_SetupDiGetClassDevsExW = nullptr;
+        o_SetupDiEnumDeviceInterfaces = nullptr;
+        o_SetupDiGetDeviceInterfaceDetailW = nullptr;
+        o_SetupDiDestroyDeviceInfoList = nullptr;
     }
 }
