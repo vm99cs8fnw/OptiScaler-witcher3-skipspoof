@@ -617,6 +617,7 @@ bool Config::Reload(std::filesystem::path iniPath)
             TargetVendorId.set_from_config(readUInt("Spoofing", "TargetVendorId"));
             TargetDeviceId.set_from_config(readUInt("Spoofing", "TargetDeviceId"));
             UESpoofIntelAtomics64.set_from_config(readBool("Spoofing", "UEIntelAtomics"));
+            HideWineRaytracing.set_from_config(readBool("Spoofing", "HideWineRaytracing"));
             SpoofRegistry.set_from_config(readBool("Spoofing", "Registry"));
             SpoofedDriver.set_from_config(readWString("Spoofing", "RegistryDriver"));
             SpoofUser32.set_from_config(readBool("Spoofing", "User32"));
@@ -1311,6 +1312,8 @@ bool Config::SaveIni()
                      GetBoolValue(Instance()->SpoofFeatureLevel.value_for_config()).c_str());
         ini.SetValue("Spoofing", "UEIntelAtomics",
                      GetBoolValue(Instance()->UESpoofIntelAtomics64.value_for_config()).c_str());
+        ini.SetValue("Spoofing", "HideWineRaytracing",
+                     GetBoolValue(Instance()->HideWineRaytracing.value_for_config()).c_str());
         ini.SetValue("Spoofing", "SpoofedVendorId",
                      GetIntValue(Instance()->SpoofedVendorId.value_for_config(), true).c_str());
         ini.SetValue("Spoofing", "SpoofedDeviceId",

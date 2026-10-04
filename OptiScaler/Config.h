@@ -462,6 +462,10 @@ class Config
     CustomOptional<uint32_t, NoDefault> TargetDeviceId;
     CustomOptional<std::wstring> SpoofedGPUName { L"NVIDIA GeForce RTX 4090" };
     CustomOptional<bool> UESpoofIntelAtomics64 { false };
+    // Wine/D3DMetal: true forces OPTIONS5 RaytracingTier to NOT_SUPPORTED.
+    // Witcher ShadeProbes spun when tier 1.1 (Agility value 11) was visible.
+    // false lets D3DMetal's real tier through. Default true keeps the safe hide.
+    CustomOptional<bool> HideWineRaytracing { true };
     CustomOptional<bool> SpoofRegistry { false };
     CustomOptional<bool> SpoofUser32 { false };
     CustomOptional<std::wstring> SpoofedDriver { L"32.0.15.9155" };

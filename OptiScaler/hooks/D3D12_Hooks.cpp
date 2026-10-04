@@ -1785,23 +1785,36 @@ static HRESULT CheckFeatureSupportBody(PFN_CheckFeatureSupport orig, ID3D12Devic
     }
 
     // Witcher next-gen, Wine/D3DMetal, DXGI spoofed as RTX 4090:
-    // the load screen presents for ~50s while VRAM climbs to ~4GB, then a job
-    // thread spins in ShadeProbes (witcher3+0x1cf3aba SwitchToThread) waiting
-    // on the job id at global+0x108f4. The following scope in that function is
-    // BuildAccelerationStructures. No slDLSSSetOptions / CreateFeature / Evaluate
-    // is in that wait. D3DMetal can still report a raytracing tier; combined
-    // with the NVIDIA spoof the game starts an RT/probe job that never completes.
-    // DLSS/MetalFX does not need DXR. Report tier 0 on Wine.
+    // load screen presents, then a job thread spins in ShadeProbes
+    // (BuildAccelerationStructures) if the game sees a raytracing tier.
+    // D3DMetal on this Mac reported tier 11, which is Agility SDK
+    // D3D12_RAYTRACING_TIER_1_1 (not the older SDK value 20).
+    // Cyberpunk RT uses that same D3DMetal tier. Witcher RTXGI probes did not
+    // complete. HideWineRaytracing (default true) keeps the tier-0 hide.
+    // Set it false to let the real tier through for RT reflections tests.
+    // DLSS/MetalFX upscale does not need DXR.
     if (onWine && SUCCEEDED(result) && pFeatureSupportData != nullptr &&
         Feature == D3D12_FEATURE_D3D12_OPTIONS5 &&
         FeatureSupportDataSize >= sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS5))
     {
         auto* opt5 = reinterpret_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS5*>(pFeatureSupportData);
         static bool logged = false;
-        if (opt5->RaytracingTier != D3D12_RAYTRACING_TIER_NOT_SUPPORTED)
+        const bool hide = Config::Instance()->HideWineRaytracing.value_or_default();
+        if (!hide)
+        {
+            if (!logged)
+            {
+                logged = true;
+                LOG_WARN("MetalFX: OPTIONS5 passthrough RaytracingTier {} SRV {} RenderPass {} "
+                         "(HideWineRaytracing=false)",
+                         (int) opt5->RaytracingTier, (int) opt5->SRVOnlyTiledResourceTier3,
+                         (int) opt5->RenderPassesTier);
+            }
+        }
+        else if (opt5->RaytracingTier != D3D12_RAYTRACING_TIER_NOT_SUPPORTED)
         {
             LOG_WARN("MetalFX: OPTIONS5 RaytracingTier {} -> NOT_SUPPORTED on Wine "
-                     "(avoid ShadeProbes/BuildAccelerationStructures job spin)",
+                     "(HideWineRaytracing=true, avoid ShadeProbes spin)",
                      (int) opt5->RaytracingTier);
             opt5->RaytracingTier = D3D12_RAYTRACING_TIER_NOT_SUPPORTED;
         }
