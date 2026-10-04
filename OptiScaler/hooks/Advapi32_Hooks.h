@@ -266,9 +266,16 @@ struct OPTI_HIDD_ATTRIBUTES
 
 typedef BOOLEAN(WINAPI* PFN_HidD_GetAttributes)(HANDLE, OPTI_HIDD_ATTRIBUTES*);
 typedef BOOLEAN(WINAPI* PFN_HidD_GetManufacturerString)(HANDLE, PVOID, ULONG);
+typedef BOOLEAN(WINAPI* PFN_HidD_GetPreparsedData)(HANDLE, PVOID*);
+typedef BOOLEAN(WINAPI* PFN_HidD_FreePreparsedData)(PVOID);
+typedef LONG(WINAPI* PFN_HidP_GetCaps)(PVOID, PVOID);
 
 static PFN_HidD_GetAttributes o_HidD_GetAttributes = nullptr;
 static PFN_HidD_GetManufacturerString o_HidD_GetManufacturerString = nullptr;
+static PFN_HidD_GetPreparsedData o_HidD_GetPreparsedData = nullptr;
+static PFN_HidD_FreePreparsedData o_HidD_FreePreparsedData = nullptr;
+static PFN_HidP_GetCaps o_HidP_GetCaps = nullptr;
+static int g_hidPreparsedSentinel = 0;
 
 static bool IsNulStandIn(HANDLE handle)
 {
@@ -315,6 +322,68 @@ static BOOLEAN WINAPI hkHidD_GetManufacturerString(HANDLE HidDeviceObject, PVOID
     {
         logged = true;
         LOG_WARN("HidD_GetManufacturerString stand-in TRUE");
+    }
+    return TRUE;
+}
+
+static bool IsHidPreparsedSentinel(PVOID data)
+{
+    return data == &g_hidPreparsedSentinel;
+}
+
+// After the DualShock id check, Witcher calls HidD_GetPreparsedData. FALSE
+// makes the helper return 0x8001002b, close the handle, and Sleep(500).
+static BOOLEAN WINAPI hkHidD_GetPreparsedData(HANDLE HidDeviceObject, PVOID* PreparsedData)
+{
+    if (!IsNulStandIn(HidDeviceObject))
+        return o_HidD_GetPreparsedData ? o_HidD_GetPreparsedData(HidDeviceObject, PreparsedData) : FALSE;
+
+    if (PreparsedData == nullptr)
+        return FALSE;
+
+    *PreparsedData = &g_hidPreparsedSentinel;
+    static bool logged = false;
+    if (!logged)
+    {
+        logged = true;
+        LOG_WARN("HidD_GetPreparsedData stand-in TRUE");
+    }
+    return TRUE;
+}
+
+static LONG WINAPI hkHidP_GetCaps(PVOID PreparsedData, PVOID Capabilities)
+{
+    if (!IsHidPreparsedSentinel(PreparsedData))
+        return o_HidP_GetCaps ? o_HidP_GetCaps(PreparsedData, Capabilities) : static_cast<LONG>(0xC0110001);
+
+    if (Capabilities == nullptr)
+        return static_cast<LONG>(0xC0110001);
+
+    auto* bytes = static_cast<unsigned char*>(Capabilities);
+    // InputReportByteLength > 0x40 skips HidD_GetFeature. FeatureReportByteLength
+    // must be at least 0x10 or the helper rejects the caps.
+    *reinterpret_cast<USHORT*>(bytes + 4) = 0x41;
+    *reinterpret_cast<USHORT*>(bytes + 8) = 0x10;
+
+    static bool logged = false;
+    if (!logged)
+    {
+        logged = true;
+        LOG_WARN("HidP_GetCaps stand-in 0x110000");
+    }
+    return static_cast<LONG>(0x00110000);
+}
+
+static BOOLEAN WINAPI hkHidD_FreePreparsedData(PVOID PreparsedData)
+{
+    if (!IsHidPreparsedSentinel(PreparsedData))
+        return o_HidD_FreePreparsedData ? o_HidD_FreePreparsedData(PreparsedData) : FALSE;
+
+    static bool logged = false;
+    if (!logged)
+    {
+        logged = true;
+        LOG_WARN("HidD_FreePreparsedData stand-in TRUE");
     }
     return TRUE;
 }
@@ -1022,6 +1091,11 @@ static void hookAdvapi32()
         reinterpret_cast<PFN_HidD_GetAttributes>(DetourFindFunction("hid.dll", "HidD_GetAttributes"));
     o_HidD_GetManufacturerString = reinterpret_cast<PFN_HidD_GetManufacturerString>(
         DetourFindFunction("hid.dll", "HidD_GetManufacturerString"));
+    o_HidD_GetPreparsedData = reinterpret_cast<PFN_HidD_GetPreparsedData>(
+        DetourFindFunction("hid.dll", "HidD_GetPreparsedData"));
+    o_HidD_FreePreparsedData = reinterpret_cast<PFN_HidD_FreePreparsedData>(
+        DetourFindFunction("hid.dll", "HidD_FreePreparsedData"));
+    o_HidP_GetCaps = reinterpret_cast<PFN_HidP_GetCaps>(DetourFindFunction("hid.dll", "HidP_GetCaps"));
 
     if (Config::Instance()->SpoofHAGS.value_or_default() || Config::Instance()->SpoofRegistry.value_or_default())
     {
@@ -1074,6 +1148,15 @@ static void hookAdvapi32()
     if (o_HidD_GetManufacturerString)
         DetourAttach(&(PVOID&) o_HidD_GetManufacturerString, hkHidD_GetManufacturerString);
 
+    if (o_HidD_GetPreparsedData)
+        DetourAttach(&(PVOID&) o_HidD_GetPreparsedData, hkHidD_GetPreparsedData);
+
+    if (o_HidD_FreePreparsedData)
+        DetourAttach(&(PVOID&) o_HidD_FreePreparsedData, hkHidD_FreePreparsedData);
+
+    if (o_HidP_GetCaps)
+        DetourAttach(&(PVOID&) o_HidP_GetCaps, hkHidP_GetCaps);
+
     auto detourResult = DetourTransactionCommit();
     if (detourResult != NO_ERROR)
     {
@@ -1091,6 +1174,9 @@ static void hookAdvapi32()
         o_CreateFileW = nullptr;
         o_HidD_GetAttributes = nullptr;
         o_HidD_GetManufacturerString = nullptr;
+        o_HidD_GetPreparsedData = nullptr;
+        o_HidD_FreePreparsedData = nullptr;
+        o_HidP_GetCaps = nullptr;
     }
 }
 
@@ -1138,6 +1224,15 @@ static void unhookAdvapi32()
     if (o_HidD_GetManufacturerString)
         DetourDetach(&(PVOID&) o_HidD_GetManufacturerString, hkHidD_GetManufacturerString);
 
+    if (o_HidD_GetPreparsedData)
+        DetourDetach(&(PVOID&) o_HidD_GetPreparsedData, hkHidD_GetPreparsedData);
+
+    if (o_HidD_FreePreparsedData)
+        DetourDetach(&(PVOID&) o_HidD_FreePreparsedData, hkHidD_FreePreparsedData);
+
+    if (o_HidP_GetCaps)
+        DetourDetach(&(PVOID&) o_HidP_GetCaps, hkHidP_GetCaps);
+
     auto detourResult = DetourTransactionCommit();
     if (detourResult != NO_ERROR)
     {
@@ -1158,5 +1253,8 @@ static void unhookAdvapi32()
         o_CreateFileW = nullptr;
         o_HidD_GetAttributes = nullptr;
         o_HidD_GetManufacturerString = nullptr;
+        o_HidD_GetPreparsedData = nullptr;
+        o_HidD_FreePreparsedData = nullptr;
+        o_HidP_GetCaps = nullptr;
     }
 }
