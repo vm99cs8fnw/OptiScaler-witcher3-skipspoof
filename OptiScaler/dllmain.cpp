@@ -2053,6 +2053,8 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
             {
                 spdlog::warn("Not running on Nvidia, keeping DLSS for NGX passthrough (original nvngx)");
                 Config::Instance()->DLSSEnabled.set_volatile_value(true);
+                if (HMODULE ngx = GetModuleHandleW(L"nvngx.dll"))
+                    HookNgxApi(ngx);
             }
             else
             {
@@ -2064,6 +2066,8 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
         {
             spdlog::warn("DLSS.Enabled is false but passthrough requested, enabling original nvngx");
             Config::Instance()->DLSSEnabled.set_volatile_value(true);
+            if (HMODULE ngx = GetModuleHandleW(L"nvngx.dll"))
+                HookNgxApi(ngx);
         }
         else
         {

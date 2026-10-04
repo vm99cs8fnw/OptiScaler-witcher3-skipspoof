@@ -12,6 +12,7 @@
 
 #include "detours/detours.h"
 
+#include <cstring>
 #include <filesystem>
 #include <vulkan/vulkan.hpp>
 
@@ -37,7 +38,30 @@ inline static NVSDK_NGX_Result __stdcall Hooked_Dx12_GetFeatureRequirements(
 {
     LOG_FUNC();
 
-    auto result = Original_D3D12_GetFeatureRequirements(Adapter, FeatureDiscoveryInfo, OutSupported);
+    const bool fgPassthrough = Config::Instance()->NgxDlssPassthrough() && FeatureDiscoveryInfo != nullptr &&
+                               FeatureDiscoveryInfo->FeatureID == NVSDK_NGX_Feature_FrameGeneration;
+
+    auto result = NVSDK_NGX_Result_FAIL_FeatureNotSupported;
+    if (Original_D3D12_GetFeatureRequirements != nullptr)
+        result = Original_D3D12_GetFeatureRequirements(Adapter, FeatureDiscoveryInfo, OutSupported);
+
+    if (fgPassthrough)
+    {
+        const bool already = result == NVSDK_NGX_Result_Success && OutSupported != nullptr &&
+                             OutSupported->FeatureSupported == NVSDK_NGX_FeatureSupportResult_Supported;
+        LOG_INFO("MetalFX hooked GetFeatureRequirements FrameGeneration real {0:X}", (UINT) result);
+        if (!already && OutSupported != nullptr)
+        {
+            if (result != NVSDK_NGX_Result_Success)
+                memset(OutSupported, 0, sizeof(*OutSupported));
+            OutSupported->FeatureSupported = NVSDK_NGX_FeatureSupportResult_Supported;
+            OutSupported->MinHWArchitecture = 0;
+            strcpy_s(OutSupported->MinOSVersion, "10.0.10240.16384");
+            LOG_INFO("MetalFX hooked GetFeatureRequirements FrameGeneration forced Supported");
+            return NVSDK_NGX_Result_Success;
+        }
+        return already ? result : NVSDK_NGX_Result_Success;
+    }
 
     if (result == NVSDK_NGX_Result_Success && FeatureDiscoveryInfo->FeatureID == NVSDK_NGX_Feature_SuperSampling)
     {

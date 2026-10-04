@@ -92,6 +92,8 @@ class StreamlineHooks
     static bool isCommonHooked();
     static bool isPclHooked();
     static bool isReflexHooked();
+    // Used by the DLSS-G passthrough spoof in the cpp. Not a DXGI spoof.
+    static SystemCaps* systemCapsForDlssg() { return systemCaps; }
 
   private:
     static sl::RenderAPI renderApi;

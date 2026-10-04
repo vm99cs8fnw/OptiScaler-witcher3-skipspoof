@@ -7,6 +7,7 @@
 
 #include <fsr4/FSR4Upgrade.h>
 #include <fsr4/FSR4ModelSelection.h>
+#include <proxies/NVNGX_Proxy.h>
 
 #include <Util.h>
 #include <State.h>
@@ -92,6 +93,20 @@ extern "C" NVSDK_NGX_Result MetalFx_D3D12_CreateFeature_Forward(ID3D12GraphicsCo
                                                                    NVSDK_NGX_Feature InFeatureID,
                                                                    NVSDK_NGX_Parameter* InParameters,
                                                                    NVSDK_NGX_Handle** OutHandle);
+extern "C" NVSDK_NGX_Result MetalFx_D3D12_EvaluateFeature_Forward(ID3D12GraphicsCommandList* InCmdList,
+                                                                  const NVSDK_NGX_Handle* InFeatureHandle,
+                                                                  NVSDK_NGX_Parameter* InParameters,
+                                                                  PFN_NVSDK_NGX_ProgressCallback InCallback);
+extern "C" NVSDK_NGX_Result MetalFx_D3D12_GetFeatureRequirements_Forward(
+    IDXGIAdapter* Adapter, const NVSDK_NGX_FeatureDiscoveryInfo* FeatureDiscoveryInfo,
+    NVSDK_NGX_FeatureRequirement* OutSupported);
+
+using PFN_MetalFxEvaluate = NVSDK_NGX_Result (*)(ID3D12GraphicsCommandList*, const NVSDK_NGX_Handle*,
+                                                 NVSDK_NGX_Parameter*, PFN_NVSDK_NGX_ProgressCallback);
+using PFN_MetalFxRequirements = NVSDK_NGX_Result (*)(IDXGIAdapter*, const NVSDK_NGX_FeatureDiscoveryInfo*,
+                                                     NVSDK_NGX_FeatureRequirement*);
+extern "C" PFN_MetalFxEvaluate g_MetalFx_Real_D3D12_EvaluateFeature;
+extern "C" PFN_MetalFxRequirements g_MetalFx_Real_D3D12_GetFeatureRequirements;
 
 static FARPROC MetalFxCreateFeatureFromGetProcAddress(HMODULE hModule, LPCSTR lpProcName, FARPROC real)
 {
@@ -117,14 +132,73 @@ static FARPROC MetalFxCreateFeatureFromGetProcAddress(HMODULE hModule, LPCSTR lp
     return (FARPROC) &MetalFx_D3D12_CreateFeature_Forward;
 }
 
+static bool NameIsNvngxCore(const wchar_t* name)
+{
+    if (name == nullptr)
+        return false;
+    std::wstring lower(name);
+    for (auto& c : lower)
+        c = (wchar_t) towlower(c);
+    if (lower.find(L"nvngx_") != std::wstring::npos)
+        return false;
+    return lower.find(L"nvngx.dll") != std::wstring::npos;
+}
+
+static void HookLoadedNvngx(HMODULE module, const wchar_t* name)
+{
+    if (!NameIsNvngxCore(name) || module == nullptr || module == dllModule)
+        return;
+    if (!Config::Instance()->NgxDlssPassthrough())
+        return;
+    LOG_INFO("MetalFX: nvngx core loaded ({0:X}), hooking GetFeatureRequirements", (uint64_t) module);
+    HookNgxApi(module);
+}
+
 static FARPROC MaybeRedirectCreateFeature(HMODULE hModule, LPCSTR lpProcName,
                                           FARPROC(WINAPI* original)(HMODULE, LPCSTR))
 {
-    if (lpProcName == nullptr || strcmp(lpProcName, "NVSDK_NGX_D3D12_CreateFeature") != 0)
+    if (lpProcName == nullptr)
         return nullptr;
 
-    auto real = original(hModule, lpProcName);
-    return MetalFxCreateFeatureFromGetProcAddress(hModule, lpProcName, real);
+    if (strcmp(lpProcName, "NVSDK_NGX_D3D12_CreateFeature") == 0)
+    {
+        auto real = original(hModule, lpProcName);
+        return MetalFxCreateFeatureFromGetProcAddress(hModule, lpProcName, real);
+    }
+
+    if (strcmp(lpProcName, "NVSDK_NGX_D3D12_EvaluateFeature") == 0)
+    {
+        auto real = original(hModule, lpProcName);
+        if (real == nullptr || hModule == dllModule)
+            return real;
+        g_MetalFx_Real_D3D12_EvaluateFeature = (PFN_MetalFxEvaluate) real;
+        static bool logged = false;
+        if (!logged)
+        {
+            logged = true;
+            LOG_INFO("MetalFX: installed NVSDK_NGX_D3D12_EvaluateFeature forwarder real {0:X}", (uint64_t) real);
+        }
+        return (FARPROC) &MetalFx_D3D12_EvaluateFeature_Forward;
+    }
+
+    if (strcmp(lpProcName, "NVSDK_NGX_D3D12_GetFeatureRequirements") == 0)
+    {
+        auto real = original(hModule, lpProcName);
+        if (real == nullptr || hModule == dllModule)
+            return real;
+        if (Config::Instance()->NgxDlssPassthrough())
+            HookNgxApi(hModule);
+        g_MetalFx_Real_D3D12_GetFeatureRequirements = (PFN_MetalFxRequirements) real;
+        static bool logged = false;
+        if (!logged)
+        {
+            logged = true;
+            LOG_INFO("MetalFX: installed NVSDK_NGX_D3D12_GetFeatureRequirements forwarder real {0:X}", (uint64_t) real);
+        }
+        return (FARPROC) &MetalFx_D3D12_GetFeatureRequirements_Forward;
+    }
+
+    return nullptr;
 }
 
 VALIDATE_HOOK(hk_K32_GetProcAddress, Kernel32Proxy::PFN_GetProcAddress)
@@ -139,8 +213,14 @@ FARPROC WINAPI KernelHooks::hk_K32_GetProcAddress(HMODULE hModule, LPCSTR lpProc
         return o_K32_GetProcAddress(hModule, lpProcName);
     }
 
-    if (lpProcName != nullptr && strcmp(lpProcName, "NVSDK_NGX_D3D12_CreateFeature") == 0)
-        return MaybeRedirectCreateFeature(hModule, lpProcName, o_K32_GetProcAddress);
+    if (lpProcName != nullptr)
+    {
+        auto redirected = MaybeRedirectCreateFeature(hModule, lpProcName, o_K32_GetProcAddress);
+        if (redirected != nullptr || strcmp(lpProcName, "NVSDK_NGX_D3D12_CreateFeature") == 0 ||
+            strcmp(lpProcName, "NVSDK_NGX_D3D12_EvaluateFeature") == 0 ||
+            strcmp(lpProcName, "NVSDK_NGX_D3D12_GetFeatureRequirements") == 0)
+            return redirected;
+    }
 
     // if (hModule == dllModule && lpProcName != nullptr)
     //{
@@ -221,8 +301,14 @@ FARPROC WINAPI KernelHooks::hk_KB_GetProcAddress(HMODULE hModule, LPCSTR lpProcN
         return o_KB_GetProcAddress(hModule, lpProcName);
     }
 
-    if (lpProcName != nullptr && strcmp(lpProcName, "NVSDK_NGX_D3D12_CreateFeature") == 0)
-        return MaybeRedirectCreateFeature(hModule, lpProcName, o_KB_GetProcAddress);
+    if (lpProcName != nullptr)
+    {
+        auto redirected = MaybeRedirectCreateFeature(hModule, lpProcName, o_KB_GetProcAddress);
+        if (redirected != nullptr || strcmp(lpProcName, "NVSDK_NGX_D3D12_CreateFeature") == 0 ||
+            strcmp(lpProcName, "NVSDK_NGX_D3D12_EvaluateFeature") == 0 ||
+            strcmp(lpProcName, "NVSDK_NGX_D3D12_GetFeatureRequirements") == 0)
+            return redirected;
+    }
 
     // if (hModule == dllModule && lpProcName != nullptr)
     //{
@@ -330,7 +416,9 @@ HMODULE KernelHooks::hk_K32_LoadLibraryW(LPCWSTR lpLibFileName)
     if (result != nullptr)
         return result;
 
-    return o_K32_LoadLibraryW(lpLibFileName);
+    auto loaded = o_K32_LoadLibraryW(lpLibFileName);
+    HookLoadedNvngx(loaded, lpLibFileName);
+    return loaded;
 }
 
 VALIDATE_HOOK(hk_K32_LoadLibraryA, Kernel32Proxy::PFN_LoadLibraryA)
@@ -351,7 +439,9 @@ HMODULE KernelHooks::hk_K32_LoadLibraryA(LPCSTR lpLibFileName)
     if (result != nullptr)
         return result;
 
-    return o_K32_LoadLibraryA(lpLibFileName);
+    auto loaded = o_K32_LoadLibraryA(lpLibFileName);
+    HookLoadedNvngx(loaded, name.c_str());
+    return loaded;
 }
 
 VALIDATE_HOOK(hk_K32_LoadLibraryExW, Kernel32Proxy::PFN_LoadLibraryExW)
@@ -371,7 +461,9 @@ HMODULE KernelHooks::hk_K32_LoadLibraryExW(LPCWSTR lpLibFileName, HANDLE hFile, 
     if (result != nullptr)
         return result;
 
-    return o_K32_LoadLibraryExW(lpLibFileName, hFile, dwFlags);
+    auto loaded = o_K32_LoadLibraryExW(lpLibFileName, hFile, dwFlags);
+    HookLoadedNvngx(loaded, lpLibFileName);
+    return loaded;
 }
 
 VALIDATE_HOOK(hk_K32_LoadLibraryExA, Kernel32Proxy::PFN_LoadLibraryExA)
@@ -392,7 +484,9 @@ HMODULE KernelHooks::hk_K32_LoadLibraryExA(LPCSTR lpLibFileName, HANDLE hFile, D
     if (result != nullptr)
         return result;
 
-    return o_K32_LoadLibraryExA(lpLibFileName, hFile, dwFlags);
+    auto loaded = o_K32_LoadLibraryExA(lpLibFileName, hFile, dwFlags);
+    HookLoadedNvngx(loaded, name.c_str());
+    return loaded;
 }
 
 VALIDATE_HOOK(hk_KB_LoadLibraryExW, KernelBaseProxy::PFN_LoadLibraryExW)
@@ -412,7 +506,9 @@ HMODULE KernelHooks::hk_KB_LoadLibraryExW(LPCWSTR lpLibFileName, HANDLE hFile, D
     if (result != nullptr)
         return result;
 
-    return o_KB_LoadLibraryExW(lpLibFileName, hFile, dwFlags);
+    auto loaded = o_KB_LoadLibraryExW(lpLibFileName, hFile, dwFlags);
+    HookLoadedNvngx(loaded, lpLibFileName);
+    return loaded;
 }
 
 VALIDATE_HOOK(hk_K32_FreeLibrary, Kernel32Proxy::PFN_FreeLibrary)

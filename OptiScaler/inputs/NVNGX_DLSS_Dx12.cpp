@@ -53,6 +53,55 @@ static thread_local int g_realNvngxCreateDepth = 0;
 // Call CrossOver system32 nvngx (MetalFX) on this thread and return its result.
 // No FSR feature, no worker thread: a command list is not free-threaded, and a
 // timeout used to return while MetalFX was still running.
+static const char* MetalFxFeatureName(NVSDK_NGX_Feature id)
+{
+    if (id == NVSDK_NGX_Feature_SuperSampling)
+        return "SuperSampling";
+    if (id == NVSDK_NGX_Feature_RayReconstruction)
+        return "RayReconstruction";
+    if (id == NVSDK_NGX_Feature_FrameGeneration)
+        return "FrameGeneration";
+    return "other";
+}
+
+// Handles created by D3DMetal for feature 11. Evaluate does not carry a feature id.
+static NVSDK_NGX_Handle* g_metalFxFgHandles[8] {};
+static int g_metalFxFgHandleCount = 0;
+
+static void RememberMetalFxFgHandle(NVSDK_NGX_Handle* handle)
+{
+    if (handle == nullptr)
+        return;
+    for (int i = 0; i < g_metalFxFgHandleCount; i++)
+    {
+        if (g_metalFxFgHandles[i] == handle)
+            return;
+    }
+    if (g_metalFxFgHandleCount < 8)
+        g_metalFxFgHandles[g_metalFxFgHandleCount++] = handle;
+}
+
+static bool IsMetalFxFgHandle(const NVSDK_NGX_Handle* handle)
+{
+    if (handle == nullptr)
+        return false;
+    for (int i = 0; i < g_metalFxFgHandleCount; i++)
+    {
+        if (g_metalFxFgHandles[i] == handle)
+            return true;
+    }
+    return false;
+}
+
+static void ForceFrameGenerationRequirements(NVSDK_NGX_FeatureRequirement* OutSupported)
+{
+    if (OutSupported == nullptr)
+        return;
+    OutSupported->FeatureSupported = NVSDK_NGX_FeatureSupportResult_Supported;
+    OutSupported->MinHWArchitecture = 0;
+    strcpy_s(OutSupported->MinOSVersion, "10.0.10240.16384");
+}
+
 static NVSDK_NGX_Result CallMetalFxCreateFeature(ID3D12GraphicsCommandList* InCmdList, NVSDK_NGX_Feature InFeatureID,
                                                  NVSDK_NGX_Parameter* InParameters, NVSDK_NGX_Handle** OutHandle)
 {
@@ -65,7 +114,8 @@ static NVSDK_NGX_Result CallMetalFxCreateFeature(ID3D12GraphicsCommandList* InCm
         return original(InCmdList, InFeatureID, InParameters, OutHandle);
     }
 
-    LOG_INFO("MetalFX D3D12_CreateFeature entry feature {0}", (int) InFeatureID);
+    LOG_INFO("MetalFX D3D12_CreateFeature entry feature {0} ({1})", (int) InFeatureID,
+             MetalFxFeatureName(InFeatureID));
 
     if (OutHandle == nullptr)
     {
@@ -97,7 +147,22 @@ static NVSDK_NGX_Result CallMetalFxCreateFeature(ID3D12GraphicsCommandList* InCm
     auto result = original(InCmdList, InFeatureID, InParameters, OutHandle);
     g_realNvngxCreateDepth--;
 
-    LOG_INFO("MetalFX D3D12_CreateFeature result feature {0}: {1:X} handle {2:X}", (int) InFeatureID, (UINT) result,
+    if (InFeatureID == NVSDK_NGX_Feature_FrameGeneration)
+    {
+        if (result == NVSDK_NGX_Result_Success)
+        {
+            RememberMetalFxFgHandle(OutHandle != nullptr ? *OutHandle : nullptr);
+            LOG_INFO("MetalFX FrameGeneration CreateFeature success handle {0:X}",
+                     (UINT64) (uintptr_t) (OutHandle != nullptr ? *OutHandle : nullptr));
+        }
+        else
+        {
+            LOG_ERROR("MetalFX FrameGeneration CreateFeature failed {0:X}", (UINT) result);
+        }
+    }
+
+    LOG_INFO("MetalFX D3D12_CreateFeature result feature {0} ({1}): {2:X} handle {3:X}", (int) InFeatureID,
+             MetalFxFeatureName(InFeatureID), (UINT) result,
              (UINT64) (uintptr_t) (OutHandle != nullptr ? *OutHandle : nullptr));
     return result;
 }
@@ -110,6 +175,85 @@ NVSDK_NGX_API NVSDK_NGX_Result MetalFx_D3D12_CreateFeature_Forward(ID3D12Graphic
                                                                    NVSDK_NGX_Handle** OutHandle)
 {
     return CallMetalFxCreateFeature(InCmdList, InFeatureID, InParameters, OutHandle);
+}
+
+using PFN_MetalFxEvaluate = NVSDK_NGX_Result (*)(ID3D12GraphicsCommandList*, const NVSDK_NGX_Handle*,
+                                                 NVSDK_NGX_Parameter*, PFN_NVSDK_NGX_ProgressCallback);
+using PFN_MetalFxRequirements = NVSDK_NGX_Result (*)(IDXGIAdapter*, const NVSDK_NGX_FeatureDiscoveryInfo*,
+                                                     NVSDK_NGX_FeatureRequirement*);
+
+extern "C" PFN_MetalFxEvaluate g_MetalFx_Real_D3D12_EvaluateFeature = nullptr;
+extern "C" PFN_MetalFxRequirements g_MetalFx_Real_D3D12_GetFeatureRequirements = nullptr;
+
+// GetProcAddress forwarder. Calls the real D3DMetal export and logs FG success/fail.
+NVSDK_NGX_API NVSDK_NGX_Result MetalFx_D3D12_EvaluateFeature_Forward(ID3D12GraphicsCommandList* InCmdList,
+                                                                     const NVSDK_NGX_Handle* InFeatureHandle,
+                                                                     NVSDK_NGX_Parameter* InParameters,
+                                                                     PFN_NVSDK_NGX_ProgressCallback InCallback)
+{
+    const bool fg = IsMetalFxFgHandle(InFeatureHandle);
+    static int logged = 0;
+    const bool logThis = fg || logged < 8;
+    if (logThis && !fg)
+        logged++;
+
+    if (fg)
+        LOG_INFO("MetalFX FrameGeneration EvaluateFeature entry handle {0:X}",
+                 (UINT64) (uintptr_t) InFeatureHandle);
+
+    if (g_MetalFx_Real_D3D12_EvaluateFeature == nullptr)
+    {
+        LOG_ERROR("MetalFX D3D12_EvaluateFeature export missing");
+        return NVSDK_NGX_Result_FAIL_FeatureNotSupported;
+    }
+
+    auto result = g_MetalFx_Real_D3D12_EvaluateFeature(InCmdList, InFeatureHandle, InParameters, InCallback);
+    if (fg)
+    {
+        if (result == NVSDK_NGX_Result_Success)
+            LOG_INFO("MetalFX FrameGeneration EvaluateFeature success handle {0:X}",
+                     (UINT64) (uintptr_t) InFeatureHandle);
+        else
+            LOG_ERROR("MetalFX FrameGeneration EvaluateFeature failed handle {0:X} result {1:X}",
+                      (UINT64) (uintptr_t) InFeatureHandle, (UINT) result);
+    }
+    else if (logThis || result != NVSDK_NGX_Result_Success)
+    {
+        LOG_INFO("MetalFX D3D12_EvaluateFeature result handle {0}: {1:X}",
+                 InFeatureHandle != nullptr ? InFeatureHandle->Id : 0u, (UINT) result);
+    }
+    return result;
+}
+
+// Streamline asks NGX whether feature 11 exists before it will keep sl.dlss_g loaded.
+// Answer Supported without changing the DXGI adapter (that spoof breaks MetalFX upscale).
+NVSDK_NGX_API NVSDK_NGX_Result MetalFx_D3D12_GetFeatureRequirements_Forward(
+    IDXGIAdapter* Adapter, const NVSDK_NGX_FeatureDiscoveryInfo* FeatureDiscoveryInfo,
+    NVSDK_NGX_FeatureRequirement* OutSupported)
+{
+    const bool fg = NgxPassthrough() && FeatureDiscoveryInfo != nullptr &&
+                    FeatureDiscoveryInfo->FeatureID == NVSDK_NGX_Feature_FrameGeneration;
+
+    NVSDK_NGX_Result result = NVSDK_NGX_Result_FAIL_FeatureNotSupported;
+    if (g_MetalFx_Real_D3D12_GetFeatureRequirements != nullptr)
+        result = g_MetalFx_Real_D3D12_GetFeatureRequirements(Adapter, FeatureDiscoveryInfo, OutSupported);
+
+    if (!fg)
+        return result;
+
+    const bool already = result == NVSDK_NGX_Result_Success && OutSupported != nullptr &&
+                         OutSupported->FeatureSupported == NVSDK_NGX_FeatureSupportResult_Supported;
+    LOG_INFO("MetalFX GetFeatureRequirements FrameGeneration real {0:X} alreadySupported {1}", (UINT) result,
+             already ? 1 : 0);
+    if (!already)
+    {
+        if (OutSupported != nullptr && result != NVSDK_NGX_Result_Success)
+            memset(OutSupported, 0, sizeof(*OutSupported));
+        ForceFrameGenerationRequirements(OutSupported);
+        LOG_INFO("MetalFX GetFeatureRequirements FrameGeneration forced Supported");
+        return NVSDK_NGX_Result_Success;
+    }
+    return result;
 }
 
 // Call original nvngx with re-entry suppressed. Apple/system nvngx may LoadLibrary("nvngx.dll"),
@@ -679,6 +823,13 @@ NVSDK_NGX_API NVSDK_NGX_Result NVSDK_NGX_D3D12_CreateFeature(ID3D12GraphicsComma
 {
     LOG_FUNC();
 
+    // Feature 11 goes to D3DMetal's FrameGenerator. Do not build an FSR/Nukem FG context.
+    if (NgxPassthrough() && InFeatureID == NVSDK_NGX_Feature_FrameGeneration)
+    {
+        LOG_INFO("MetalFX FrameGeneration CreateFeature via Opti export -> D3DMetal nvngx");
+        return CallMetalFxCreateFeature(InCmdList, InFeatureID, InParameters, OutHandle);
+    }
+
     if (State::Instance().activeFgInput == FGInput::Nukems && DLSSGMod::isDx12Available() &&
         InFeatureID == NVSDK_NGX_Feature_FrameGeneration)
     {
@@ -892,7 +1043,8 @@ NVSDK_NGX_API NVSDK_NGX_Result NVSDK_NGX_D3D12_GetFeatureRequirements(
 
     if (FeatureDiscoveryInfo->FeatureID == NVSDK_NGX_Feature_SuperSampling ||
         (FeatureDiscoveryInfo->FeatureID == NVSDK_NGX_Feature_FrameGeneration &&
-         ((DLSSGMod::isDx12Available() && Config::Instance()->FGInput == FGInput::Nukems) ||
+         (NgxPassthrough() ||
+          (DLSSGMod::isDx12Available() && Config::Instance()->FGInput == FGInput::Nukems) ||
           Config::Instance()->FGInput == FGInput::DLSSG)))
     {
         if (OutSupported == nullptr)
@@ -903,6 +1055,8 @@ NVSDK_NGX_API NVSDK_NGX_Result NVSDK_NGX_D3D12_GetFeatureRequirements(
 
         // Some old windows 10 os version
         strcpy_s(OutSupported->MinOSVersion, "10.0.10240.16384");
+        if (FeatureDiscoveryInfo->FeatureID == NVSDK_NGX_Feature_FrameGeneration)
+            LOG_INFO("MetalFX Opti GetFeatureRequirements FrameGeneration Supported");
         return NVSDK_NGX_Result_Success;
     }
 
@@ -952,11 +1106,24 @@ NVSDK_NGX_API NVSDK_NGX_Result NVSDK_NGX_D3D12_EvaluateFeature(ID3D12GraphicsCom
         auto evalFn = NgxPassthrough() ? NVNGXProxy::D3D12_EvaluateFeatureRaw() : NVNGXProxy::D3D12_EvaluateFeature();
         if (Config::Instance()->DLSSEnabled.value_or_default() && evalFn != nullptr)
         {
-            if (NgxPassthrough())
+            const bool fg = IsMetalFxFgHandle(InFeatureHandle);
+            if (NgxPassthrough() && fg)
+                LOG_INFO("MetalFX FrameGeneration EvaluateFeature via Opti export handle {0}", handleId);
+            else if (NgxPassthrough())
                 LOG_INFO("MetalFX D3D12_EvaluateFeature via Opti export ({0})", handleId);
             LOG_DEBUG("D3D12_EvaluateFeature for ({0})", handleId);
             auto result = evalFn(InCmdList, InFeatureHandle, InParameters, InCallback);
-            LOG_DEBUG("D3D12_EvaluateFeature result for ({0}): {1:X}", handleId, (UINT) result);
+            if (fg)
+            {
+                if (result == NVSDK_NGX_Result_Success)
+                    LOG_INFO("MetalFX FrameGeneration EvaluateFeature success ({0})", handleId);
+                else
+                    LOG_ERROR("MetalFX FrameGeneration EvaluateFeature failed ({0}): {1:X}", handleId, (UINT) result);
+            }
+            else
+            {
+                LOG_DEBUG("D3D12_EvaluateFeature result for ({0}): {1:X}", handleId, (UINT) result);
+            }
             return result;
         }
         else

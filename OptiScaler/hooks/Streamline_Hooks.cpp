@@ -296,6 +296,19 @@ sl::Result StreamlineHooks::hkslEvaluateFeature(sl::Feature feature, const sl::F
     }
 
     auto result = o_slEvaluateFeature(feature, frame, inputs, numInputs, cmdBuffer);
+    if (feature == sl::kFeatureDLSS_G)
+    {
+        static int fgLogged = 0;
+        if (fgLogged < 16 || result != sl::Result::eOk)
+        {
+            fgLogged++;
+            if (result == sl::Result::eOk)
+                LOG_INFO("MetalFX slEvaluateFeature DLSS-G success frame {0}", static_cast<uint32_t>(frame));
+            else
+                LOG_ERROR("MetalFX slEvaluateFeature DLSS-G failed frame {0} result {1}", static_cast<uint32_t>(frame),
+                          (int) result);
+        }
+    }
     return result;
 }
 
@@ -379,6 +392,13 @@ sl::Result StreamlineHooks::hkslIsFeatureSupported(sl::Feature feature, const sl
         return sl::Result::eOk;
     }
 
+    // Same for DLSS-G, but only the support bit. Do not spoof the DXGI adapter.
+    if (Config::Instance()->NgxDlssPassthrough() && feature == sl::kFeatureDLSS_G && result != sl::Result::eOk)
+    {
+        LOG_WARN("MetalFX: DLSS-G slIsFeatureSupported returned {0}, forcing eOk (no DXGI spoof)", (int) result);
+        return sl::Result::eOk;
+    }
+
     return result;
 }
 
@@ -434,7 +454,20 @@ sl::Result StreamlineHooks::hkcommon_slEvaluateFeature(sl::Feature feature, cons
         return sl::Result::eErrorMissingOrInvalidAPI;
     }
     auto result = o_common_slEvaluateFeature(feature, frame, inputs, numInputs, cmdBuffer);
-    if (logThis || result != sl::Result::eOk)
+    if (feature == sl::kFeatureDLSS_G)
+    {
+        static int fgLogged = 0;
+        if (fgLogged < 16 || result != sl::Result::eOk)
+        {
+            fgLogged++;
+            if (result == sl::Result::eOk)
+                LOG_INFO("MetalFX sl.common slEvaluateFeature DLSS-G success frame {0}", static_cast<uint32_t>(frame));
+            else
+                LOG_ERROR("MetalFX sl.common slEvaluateFeature DLSS-G failed frame {0} result {1}",
+                          static_cast<uint32_t>(frame), (int) result);
+        }
+    }
+    else if (logThis || result != sl::Result::eOk)
         LOG_INFO("MetalFX sl.common slEvaluateFeature result feature {0}: {1}", (uint32_t) feature, (int) result);
     return result;
 }
@@ -794,6 +827,101 @@ sl::Result StreamlineHooks::hkslDLSSGetOptimalSettings(const sl::DLSSOptions& op
     return result;
 }
 
+
+// Snapshot of Streamline's system caps. Spoof vendor/arch/HWS only while sl.dlss_g
+// decides if it is supported, then put the real adapter back. DXGI stays non-NVIDIA
+// so MetalFX upscale keeps working.
+struct ScopedMetalFxDlssgCaps
+{
+    bool armed = false;
+    uint32_t driverMajor = 0;
+    uint32_t driverMinor = 0;
+    bool hws = false;
+    uint32_t count = 0;
+    uint32_t arch[kMaxNumSupportedGPUs] {};
+    VendorId::Value vendor[kMaxNumSupportedGPUs] {};
+
+    void arm()
+    {
+        auto* caps = StreamlineHooks::systemCapsForDlssg();
+        if (caps == nullptr || caps->gpuCount == 0)
+        {
+            LOG_WARN("MetalFX: no Streamline system caps to spoof for sl.dlss_g");
+            return;
+        }
+        armed = true;
+        count = caps->gpuCount;
+        if (count > kMaxNumSupportedGPUs)
+            count = kMaxNumSupportedGPUs;
+        driverMajor = caps->driverVersionMajor;
+        driverMinor = caps->driverVersionMinor;
+        hws = caps->hwsSupported;
+        for (uint32_t i = 0; i < count; i++)
+        {
+            arch[i] = caps->adapters[i].architecture;
+            vendor[i] = caps->adapters[i].vendor;
+            caps->adapters[i].vendor = VendorId::Nvidia;
+            caps->adapters[i].architecture = 0xFFFFFFFFu;
+        }
+        caps->driverVersionMajor = 999;
+        caps->hwsSupported = true;
+        LOG_INFO("MetalFX: temporary DLSS-G caps spoof gpus {0} (NVIDIA/arch max/HWS), DXGI unchanged", count);
+    }
+
+    void restore()
+    {
+        if (!armed)
+            return;
+        auto* caps = StreamlineHooks::systemCapsForDlssg();
+        if (caps != nullptr)
+        {
+            for (uint32_t i = 0; i < count; i++)
+            {
+                caps->adapters[i].architecture = arch[i];
+                caps->adapters[i].vendor = vendor[i];
+            }
+            caps->driverVersionMajor = driverMajor;
+            caps->driverVersionMinor = driverMinor;
+            caps->hwsSupported = hws;
+        }
+        armed = false;
+        LOG_INFO("MetalFX: restored Streamline caps after sl.dlss_g load");
+    }
+};
+
+static void ForceDlssgPluginSupported(nlohmann::json& configJson)
+{
+    uint32_t mask = 0;
+    if (configJson.contains("supportedAdapters") && configJson["supportedAdapters"].is_number())
+        mask = configJson["supportedAdapters"].get<uint32_t>();
+
+    if (mask == 0)
+    {
+        uint32_t gpus = 1;
+        if (auto* caps = StreamlineHooks::systemCapsForDlssg(); caps != nullptr && caps->gpuCount > 0)
+            gpus = caps->gpuCount;
+        if (gpus > kMaxNumSupportedGPUs)
+            gpus = kMaxNumSupportedGPUs;
+        mask = (1u << gpus) - 1u;
+        configJson["supportedAdapters"] = mask;
+        LOG_WARN("MetalFX: sl.dlss_g supportedAdapters was 0, forcing mask {0:X} so Streamline keeps the plugin",
+                 mask);
+    }
+    else
+    {
+        LOG_INFO("MetalFX: sl.dlss_g supportedAdapters {0:X}", mask);
+    }
+
+    if (configJson.contains("/external/hws/required"_json_pointer))
+        configJson["external"]["hws"]["required"] = false;
+    if (configJson.contains("/external/hws/supported"_json_pointer))
+        configJson["external"]["hws"]["supported"] = true;
+    if (configJson.contains("/external/feature/supported"_json_pointer))
+        configJson["external"]["feature"]["supported"] = true;
+    if (configJson.contains("/vsync/supported"_json_pointer))
+        configJson["vsync"]["supported"] = true;
+}
+
 bool StreamlineHooks::hkdlssg_slOnPluginLoad(sl::param::IParameters* params, const char* loaderJSON,
                                              const char** pluginJSON)
 {
@@ -802,27 +930,37 @@ bool StreamlineHooks::hkdlssg_slOnPluginLoad(sl::param::IParameters* params, con
     // TODO: do it better than "static" and hoping for the best
     static std::string config;
 
-    bool shouldSpoofArch =
-        Config::Instance()->StreamlineSpoofing.value_or_default() &&
-        (Config::Instance()->FGInput == FGInput::Nukems || Config::Instance()->FGInput == FGInput::DLSSG);
+    // Passthrough keeps the real sl.dlss_g plugin (D3DMetal FG). Do not also run the
+    // Opti FGInput spoof that clears DLSS-G hooks.
+    const bool metalFxDlssg = Config::Instance()->NgxDlssPassthrough();
+    bool shouldSpoofArch = !metalFxDlssg && Config::Instance()->StreamlineSpoofing.value_or_default() &&
+                           (Config::Instance()->FGInput == FGInput::Nukems ||
+                            Config::Instance()->FGInput == FGInput::DLSSG);
 
     uint32_t currentArch = 0;
-    if (shouldSpoofArch)
-    {
+    ScopedMetalFxDlssgCaps metalFxCaps {};
+    if (metalFxDlssg || shouldSpoofArch)
         hookSystemCaps(params);
+    if (metalFxDlssg)
+        metalFxCaps.arm();
+    else if (shouldSpoofArch)
+    {
         currentArch = getSystemCapsArch();
         spoofArch(currentArch, sl::kFeatureDLSS_G);
     }
 
     auto result = o_dlssg_slOnPluginLoad(params, loaderJSON, pluginJSON);
 
-    if (shouldSpoofArch)
+    if (metalFxDlssg)
+        metalFxCaps.restore();
+    else if (shouldSpoofArch)
         setArch(currentArch);
 
     nlohmann::json configJson = nlohmann::json::parse(*pluginJSON);
 
-    // Kill the DLSSG streamline swapchain hooks
-    if (State::Instance().activeFgInput == FGInput::DLSSG)
+    // Kill the DLSSG streamline swapchain hooks. Not for MetalFX passthrough:
+    // the real plugin must keep its hooks and call NGX FrameGeneration.
+    if (!Config::Instance()->NgxDlssPassthrough() && State::Instance().activeFgInput == FGInput::DLSSG)
     {
         if (configJson.contains("/hooks"_json_pointer))
             configJson["hooks"].clear();
@@ -866,6 +1004,9 @@ bool StreamlineHooks::hkdlssg_slOnPluginLoad(sl::param::IParameters* params, con
         if (configJson.contains("/external/vk/device/extensions"_json_pointer))
             configJson["external"]["vk"]["device"]["extensions"].clear();
     }
+
+    if (Config::Instance()->NgxDlssPassthrough())
+        ForceDlssgPluginSupported(configJson);
 
     config = configJson.dump();
 
@@ -913,6 +1054,23 @@ bool StreamlineHooks::hkcommon_slOnPluginLoad(sl::param::IParameters* params, co
 
 sl::Result StreamlineHooks::hkslDLSSGSetOptions(const sl::ViewportHandle& viewport, const sl::DLSSGOptions& options)
 {
+    if (Config::Instance()->NgxDlssPassthrough())
+    {
+        LOG_INFO("MetalFX slDLSSGSetOptions entry viewport {0} mode {1} frames {2}", (uint32_t) viewport,
+                 (uint32_t) options.mode, options.numFramesToGenerate);
+        if (o_slDLSSGSetOptions == nullptr)
+        {
+            LOG_ERROR("MetalFX slDLSSGSetOptions original missing");
+            return sl::Result::eErrorMissingOrInvalidAPI;
+        }
+        auto result = o_slDLSSGSetOptions(viewport, options);
+        if (result == sl::Result::eOk)
+            LOG_INFO("MetalFX slDLSSGSetOptions success mode {0}", (uint32_t) options.mode);
+        else
+            LOG_ERROR("MetalFX slDLSSGSetOptions failed {0}", (int) result);
+        return result;
+    }
+
     // Make DLSSG auto always mean On
     sl::DLSSGOptions newOptions = options;
     newOptions.mode = newOptions.mode == sl::DLSSGMode::eOff ? sl::DLSSGMode::eOff : sl::DLSSGMode::eOn;
@@ -1108,6 +1266,51 @@ void* StreamlineHooks::hkdlss_slGetPluginFunction(const char* functionName)
     return o_dlss_slGetPluginFunction(functionName);
 }
 
+static PFun_slAllocateResources* o_dlssg_slAllocateResources = nullptr;
+static PFun_slEvaluateFeature* o_dlssg_slEvaluateFeature = nullptr;
+
+static sl::Result hkdlssg_slAllocateResources(sl::CommandBuffer* cmdBuffer, sl::Feature feature,
+                                              const sl::ViewportHandle& viewport)
+{
+    LOG_INFO("MetalFX sl.dlss_g slAllocateResources entry feature {0}", (uint32_t) feature);
+    if (o_dlssg_slAllocateResources == nullptr)
+    {
+        LOG_ERROR("MetalFX sl.dlss_g slAllocateResources original missing");
+        return sl::Result::eErrorMissingOrInvalidAPI;
+    }
+    auto result = o_dlssg_slAllocateResources(cmdBuffer, feature, viewport);
+    if (result == sl::Result::eOk)
+        LOG_INFO("MetalFX sl.dlss_g slAllocateResources success feature {0}", (uint32_t) feature);
+    else
+        LOG_ERROR("MetalFX sl.dlss_g slAllocateResources failed feature {0} result {1}", (uint32_t) feature,
+                  (int) result);
+    return result;
+}
+
+static sl::Result hkdlssg_slEvaluateFeature(sl::Feature feature, const sl::FrameToken& frame,
+                                            const sl::BaseStructure** inputs, uint32_t numInputs,
+                                            sl::CommandBuffer* cmdBuffer)
+{
+    if (o_dlssg_slEvaluateFeature == nullptr)
+    {
+        LOG_ERROR("MetalFX sl.dlss_g slEvaluateFeature original missing");
+        return sl::Result::eErrorMissingOrInvalidAPI;
+    }
+    auto result = o_dlssg_slEvaluateFeature(feature, frame, inputs, numInputs, cmdBuffer);
+    static int logged = 0;
+    if (logged < 16 || result != sl::Result::eOk)
+    {
+        logged++;
+        if (result == sl::Result::eOk)
+            LOG_INFO("MetalFX sl.dlss_g slEvaluateFeature success feature {0} frame {1}", (uint32_t) feature,
+                     static_cast<uint32_t>(frame));
+        else
+            LOG_ERROR("MetalFX sl.dlss_g slEvaluateFeature failed feature {0} frame {1} result {2}",
+                      (uint32_t) feature, static_cast<uint32_t>(frame), (int) result);
+    }
+    return result;
+}
+
 void* StreamlineHooks::hkdlssg_slGetPluginFunction(const char* functionName)
 {
     // LOG_DEBUG("{}", functionName);
@@ -1148,6 +1351,32 @@ void* StreamlineHooks::hkdlssg_slGetPluginFunction(const char* functionName)
 
         o_slDLSSGGetState = (decltype(&slDLSSGGetState)) o_dlssg_slGetPluginFunction(functionName);
         return &hkslDLSSGGetState;
+    }
+
+    if (strcmp(functionName, "slAllocateResources") == 0)
+    {
+        auto real = (PFun_slAllocateResources*) o_dlssg_slGetPluginFunction(functionName);
+        if (real == nullptr)
+        {
+            LOG_INFO("MetalFX: sl.dlss_g slAllocateResources is null; create goes through sl.common");
+            return nullptr;
+        }
+        o_dlssg_slAllocateResources = real;
+        LOG_INFO("MetalFX: installed sl.dlss_g slAllocateResources wrapper at {0:X}", (uint64_t) real);
+        return (void*) &hkdlssg_slAllocateResources;
+    }
+
+    if (strcmp(functionName, "slEvaluateFeature") == 0)
+    {
+        auto real = (PFun_slEvaluateFeature*) o_dlssg_slGetPluginFunction(functionName);
+        if (real == nullptr)
+        {
+            LOG_INFO("MetalFX: sl.dlss_g slEvaluateFeature is null; evaluate goes through sl.common");
+            return nullptr;
+        }
+        o_dlssg_slEvaluateFeature = real;
+        LOG_INFO("MetalFX: installed sl.dlss_g slEvaluateFeature wrapper at {0:X}", (uint64_t) real);
+        return (void*) &hkdlssg_slEvaluateFeature;
     }
 
     return o_dlssg_slGetPluginFunction(functionName);
