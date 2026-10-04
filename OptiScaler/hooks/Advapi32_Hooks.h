@@ -188,6 +188,7 @@ static BOOL WINAPI hkSetupDiDestroyDeviceInfoList(OPTI_HDEVINFO DeviceInfoSet)
 
 typedef HANDLE(WINAPI* PFN_CreateFileW)(LPCWSTR, DWORD, DWORD, LPSECURITY_ATTRIBUTES, DWORD, DWORD, HANDLE);
 static PFN_CreateFileW o_CreateFileW = nullptr;
+static HANDLE g_nulStandIn = nullptr;
 
 static bool IsNulDevicePath(LPCWSTR path)
 {
@@ -220,6 +221,7 @@ static HANDLE WINAPI hkCreateFileW(LPCWSTR lpFileName, DWORD dwDesiredAccess, DW
                                   flags, hTemplateFile);
     if (handle != INVALID_HANDLE_VALUE)
     {
+        g_nulStandIn = handle;
         static bool logged = false;
         if (!logged)
         {
@@ -232,6 +234,7 @@ static HANDLE WINAPI hkCreateFileW(LPCWSTR lpFileName, DWORD dwDesiredAccess, DW
     handle = OpenEmptyStandIn(dwDesiredAccess, dwShareMode, lpSecurityAttributes);
     if (handle != INVALID_HANDLE_VALUE)
     {
+        g_nulStandIn = handle;
         static bool logged = false;
         if (!logged)
         {
@@ -248,6 +251,70 @@ static HANDLE WINAPI hkCreateFileW(LPCWSTR lpFileName, DWORD dwDesiredAccess, DW
         LOG_WARN("CreateFileW NUL failed");
     }
     return INVALID_HANDLE_VALUE;
+}
+
+// Witcher opens the sentinel path, then rejects it when HidD_GetAttributes
+// returns FALSE and Sleep(500)s while holding the job-pool lock. Answer the
+// stand-in handle so the accept path can continue.
+struct OPTI_HIDD_ATTRIBUTES
+{
+    ULONG Size;
+    USHORT VendorID;
+    USHORT ProductID;
+    USHORT VersionNumber;
+};
+
+typedef BOOLEAN(WINAPI* PFN_HidD_GetAttributes)(HANDLE, OPTI_HIDD_ATTRIBUTES*);
+typedef BOOLEAN(WINAPI* PFN_HidD_GetManufacturerString)(HANDLE, PVOID, ULONG);
+
+static PFN_HidD_GetAttributes o_HidD_GetAttributes = nullptr;
+static PFN_HidD_GetManufacturerString o_HidD_GetManufacturerString = nullptr;
+
+static bool IsNulStandIn(HANDLE handle)
+{
+    return handle != nullptr && handle != INVALID_HANDLE_VALUE && handle == g_nulStandIn;
+}
+
+static BOOLEAN WINAPI hkHidD_GetAttributes(HANDLE HidDeviceObject, OPTI_HIDD_ATTRIBUTES* Attributes)
+{
+    if (!IsNulStandIn(HidDeviceObject))
+        return o_HidD_GetAttributes ? o_HidD_GetAttributes(HidDeviceObject, Attributes) : FALSE;
+
+    if (Attributes == nullptr)
+        return FALSE;
+
+    Attributes->Size = 12;
+    Attributes->VendorID = 0x045E;
+    Attributes->ProductID = 0x028E;
+    Attributes->VersionNumber = 0x0100;
+
+    static bool logged = false;
+    if (!logged)
+    {
+        logged = true;
+        LOG_WARN("HidD_GetAttributes stand-in TRUE");
+    }
+    return TRUE;
+}
+
+static BOOLEAN WINAPI hkHidD_GetManufacturerString(HANDLE HidDeviceObject, PVOID Buffer, ULONG BufferLength)
+{
+    if (!IsNulStandIn(HidDeviceObject))
+        return o_HidD_GetManufacturerString ? o_HidD_GetManufacturerString(HidDeviceObject, Buffer, BufferLength)
+                                            : FALSE;
+
+    static const wchar_t kName[] = L"HID";
+    if (Buffer == nullptr || BufferLength < sizeof(kName))
+        return FALSE;
+
+    std::memcpy(Buffer, kName, sizeof(kName));
+    static bool logged = false;
+    if (!logged)
+    {
+        logged = true;
+        LOG_WARN("HidD_GetManufacturerString stand-in TRUE");
+    }
+    return TRUE;
 }
 
 
@@ -948,6 +1015,11 @@ static void hookAdvapi32()
     o_SetupDiDestroyDeviceInfoList = reinterpret_cast<PFN_SetupDiDestroyDeviceInfoList>(
         DetourFindFunction("setupapi.dll", "SetupDiDestroyDeviceInfoList"));
     o_CreateFileW = reinterpret_cast<PFN_CreateFileW>(DetourFindFunction("kernel32.dll", "CreateFileW"));
+    LoadLibraryW(L"hid.dll");
+    o_HidD_GetAttributes =
+        reinterpret_cast<PFN_HidD_GetAttributes>(DetourFindFunction("hid.dll", "HidD_GetAttributes"));
+    o_HidD_GetManufacturerString = reinterpret_cast<PFN_HidD_GetManufacturerString>(
+        DetourFindFunction("hid.dll", "HidD_GetManufacturerString"));
 
     if (Config::Instance()->SpoofHAGS.value_or_default() || Config::Instance()->SpoofRegistry.value_or_default())
     {
@@ -994,6 +1066,12 @@ static void hookAdvapi32()
     if (o_CreateFileW)
         DetourAttach(&(PVOID&) o_CreateFileW, hkCreateFileW);
 
+    if (o_HidD_GetAttributes)
+        DetourAttach(&(PVOID&) o_HidD_GetAttributes, hkHidD_GetAttributes);
+
+    if (o_HidD_GetManufacturerString)
+        DetourAttach(&(PVOID&) o_HidD_GetManufacturerString, hkHidD_GetManufacturerString);
+
     auto detourResult = DetourTransactionCommit();
     if (detourResult != NO_ERROR)
     {
@@ -1009,6 +1087,8 @@ static void hookAdvapi32()
         o_SetupDiGetDeviceInterfaceDetailW = nullptr;
         o_SetupDiDestroyDeviceInfoList = nullptr;
         o_CreateFileW = nullptr;
+        o_HidD_GetAttributes = nullptr;
+        o_HidD_GetManufacturerString = nullptr;
     }
 }
 
@@ -1050,6 +1130,12 @@ static void unhookAdvapi32()
     if (o_CreateFileW)
         DetourDetach(&(PVOID&) o_CreateFileW, hkCreateFileW);
 
+    if (o_HidD_GetAttributes)
+        DetourDetach(&(PVOID&) o_HidD_GetAttributes, hkHidD_GetAttributes);
+
+    if (o_HidD_GetManufacturerString)
+        DetourDetach(&(PVOID&) o_HidD_GetManufacturerString, hkHidD_GetManufacturerString);
+
     auto detourResult = DetourTransactionCommit();
     if (detourResult != NO_ERROR)
     {
@@ -1068,5 +1154,7 @@ static void unhookAdvapi32()
         o_SetupDiGetDeviceInterfaceDetailW = nullptr;
         o_SetupDiDestroyDeviceInfoList = nullptr;
         o_CreateFileW = nullptr;
+        o_HidD_GetAttributes = nullptr;
+        o_HidD_GetManufacturerString = nullptr;
     }
 }
