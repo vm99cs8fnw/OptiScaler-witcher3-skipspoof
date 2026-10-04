@@ -110,14 +110,31 @@ static bool IsRunningOnWine()
 
     auto pWineGetVersion = (PFN_wine_get_version) KernelBaseProxy::GetProcAddress_()(ntdll, "wine_get_version");
 
-    // Workaround for the ntdll-Hide_Wine_Exports patch
-    if (!pWineGetVersion && KernelBaseProxy::GetProcAddress_()(ntdll, "wine_server_call") != nullptr)
+    // Workaround for the ntdll-Hide_Wine_Exports patch. CrossOver can hide every
+    // wine_* name from GetProcAddress, including wine_server_call, while the
+    // export directory still contains them.
+    if (!pWineGetVersion)
         pWineGetVersion = (PFN_wine_get_version) ManualGetProcAddress(ntdll, "wine_get_version");
+
+    if (!pWineGetVersion)
+        pWineGetVersion = (PFN_wine_get_version) ManualGetProcAddress(ntdll, "wine_get_build_id");
 
     if (pWineGetVersion)
     {
         LOG_INFO("Running on Wine {0}!", pWineGetVersion());
         return true;
+    }
+
+    // CrossOver/D3DMetal bottles set these even when wine exports are stripped.
+    char buf[4] = {};
+    const char* vars[] = { "WINEPREFIX", "WINELOADER", "CX_ROOT", "CX_BOTTLE", "CX_BOTTLE_PATH", nullptr };
+    for (int i = 0; vars[i] != nullptr; i++)
+    {
+        if (GetEnvironmentVariableA(vars[i], buf, sizeof(buf)) > 0)
+        {
+            LOG_INFO("Running on Wine/CrossOver (env {}), wine_get_version hidden", vars[i]);
+            return true;
+        }
     }
 
     LOG_WARN("Wine not detected");

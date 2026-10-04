@@ -46,6 +46,7 @@ using PFN_Release = rewrite_signature<decltype(&IUnknown::Release)>::type;
 
 static PFN_CreateSampler o_CreateSampler = nullptr;
 static PFN_CheckFeatureSupport o_CheckFeatureSupport = nullptr;
+static PFN_CheckFeatureSupport o_CheckFeatureSupportDevice5 = nullptr;
 static PFN_CreateCommittedResource o_CreateCommittedResource = nullptr;
 static PFN_CreatePlacedResource o_CreatePlacedResource = nullptr;
 static PFN_SetResidencyPriority o_SetResidencyPriority = nullptr;
@@ -1740,11 +1741,38 @@ static ULONG hkD3D12DeviceRelease(IUnknown* device)
     return result;
 }
 
-VALIDATE_HOOK(hkCheckFeatureSupport, PFN_CheckFeatureSupport)
-static HRESULT hkCheckFeatureSupport(ID3D12Device* device, D3D12_FEATURE Feature, void* pFeatureSupportData,
-                                     UINT FeatureSupportDataSize)
+static bool EnsureRunningOnWineOrCrossover()
 {
-    auto result = o_CheckFeatureSupport(device, Feature, pFeatureSupportData, FeatureSupportDataSize);
+    if (State::Instance().isRunningOnLinux)
+        return true;
+
+    // CrossOver can hide ntdll wine_* exports. The bottle still sets these.
+    char buf[4] = {};
+    const char* vars[] = { "WINEPREFIX", "WINELOADER", "CX_ROOT", "CX_BOTTLE", "CX_BOTTLE_PATH", nullptr };
+    for (int i = 0; vars[i] != nullptr; i++)
+    {
+        if (GetEnvironmentVariableA(vars[i], buf, sizeof(buf)) > 0)
+        {
+            State::Instance().isRunningOnLinux = true;
+            State::Instance().isRunningOnDXVK = true;
+            LOG_WARN("isRunningOnLinux was false; set from CrossOver/Wine env {}", vars[i]);
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static HRESULT CheckFeatureSupportBody(PFN_CheckFeatureSupport orig, ID3D12Device* device, D3D12_FEATURE Feature,
+                                       void* pFeatureSupportData, UINT FeatureSupportDataSize)
+{
+    // Every entry, before the feature switch. 2b966d4 never logged because this
+    // detour was not installed unless UEIntelAtomics was enabled.
+    const bool onWine = EnsureRunningOnWineOrCrossover();
+    LOG_INFO("CheckFeatureSupport enter feature {} size {} device {:X} linux {}", (unsigned) Feature,
+             FeatureSupportDataSize, (size_t) device, onWine ? 1 : 0);
+
+    auto result = orig(device, Feature, pFeatureSupportData, FeatureSupportDataSize);
 
     if (Config::Instance()->UESpoofIntelAtomics64.value_or_default() && Feature == D3D12_FEATURE_D3D12_OPTIONS9 &&
         device == State::Instance().currentD3D12Device)
@@ -1764,7 +1792,7 @@ static HRESULT hkCheckFeatureSupport(ID3D12Device* device, D3D12_FEATURE Feature
     // is in that wait. D3DMetal can still report a raytracing tier; combined
     // with the NVIDIA spoof the game starts an RT/probe job that never completes.
     // DLSS/MetalFX does not need DXR. Report tier 0 on Wine.
-    if (State::Instance().isRunningOnLinux && SUCCEEDED(result) && pFeatureSupportData != nullptr &&
+    if (onWine && SUCCEEDED(result) && pFeatureSupportData != nullptr &&
         Feature == D3D12_FEATURE_D3D12_OPTIONS5 &&
         FeatureSupportDataSize >= sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS5))
     {
@@ -1785,6 +1813,21 @@ static HRESULT hkCheckFeatureSupport(ID3D12Device* device, D3D12_FEATURE Feature
     }
 
     return result;
+}
+
+VALIDATE_HOOK(hkCheckFeatureSupport, PFN_CheckFeatureSupport)
+static HRESULT hkCheckFeatureSupport(ID3D12Device* device, D3D12_FEATURE Feature, void* pFeatureSupportData,
+                                     UINT FeatureSupportDataSize)
+{
+    return CheckFeatureSupportBody(o_CheckFeatureSupport, device, Feature, pFeatureSupportData, FeatureSupportDataSize);
+}
+
+VALIDATE_HOOK(hkCheckFeatureSupportDevice5, PFN_CheckFeatureSupport)
+static HRESULT hkCheckFeatureSupportDevice5(ID3D12Device* device, D3D12_FEATURE Feature, void* pFeatureSupportData,
+                                            UINT FeatureSupportDataSize)
+{
+    return CheckFeatureSupportBody(o_CheckFeatureSupportDevice5, device, Feature, pFeatureSupportData,
+                                   FeatureSupportDataSize);
 }
 
 VALIDATE_HOOK(hkCreateCommittedResource, PFN_CreateCommittedResource)
@@ -2156,9 +2199,110 @@ static HRESULT hkD3D12GetInterface(REFCLSID rclsid, REFIID riid, void** ppvDebug
     return result;
 }
 
+static const char* ModulePathForAddress(void* addr)
+{
+    static char path[MAX_PATH];
+    path[0] = '\0';
+
+    if (addr == nullptr)
+        return path;
+
+    HMODULE mod = nullptr;
+    if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           (LPCSTR) addr, &mod) &&
+        mod != nullptr)
+        GetModuleFileNameA(mod, path, MAX_PATH);
+
+    return path;
+}
+
+// CheckFeatureSupport used to be attached only inside the UEIntelAtomics block.
+// Witcher ini leaves UEIntelAtomics=auto and the real GPU is AMD, so the detour
+// never installed. hkD3D12DeviceRelease still ran (that attach is unconditional),
+// which is why the AtomicInt64 line and the OPTIONS5 line were both absent.
+// Hook the real device vtable (Streamline unwrapped) and ID3D12Device5 when its
+// CheckFeatureSupport thunk is a different function. Slot 13 is CheckFeatureSupport
+// on ID3D12Device and every derived device interface.
+static void HookCheckFeatureSupportOnDevice(ID3D12Device* InDevice)
+{
+    if (InDevice == nullptr)
+        return;
+
+    ID3D12Device* realDevice = nullptr;
+    PVOID* pVTable = *(PVOID**) InDevice;
+    if (Util::CheckForRealObject("HookCheckFeatureSupport", InDevice, (IUnknown**) &realDevice) &&
+        realDevice != nullptr)
+        pVTable = *(PVOID**) realDevice;
+
+    ID3D12Device* queryDevice = realDevice != nullptr ? realDevice : InDevice;
+    auto deviceFn = (PFN_CheckFeatureSupport) pVTable[13];
+
+    LOG_INFO("D3D12 CheckFeatureSupport vtable[13] {:X} module '{}' real {:X} in {:X}", (size_t) deviceFn,
+             ModulePathForAddress((void*) deviceFn), (size_t) realDevice, (size_t) InDevice);
+
+    PFN_CheckFeatureSupport device5Fn = nullptr;
+    ID3D12Device5* device5 = nullptr;
+    if (SUCCEEDED(queryDevice->QueryInterface(IID_PPV_ARGS(&device5))) && device5 != nullptr)
+    {
+        PVOID* vt5 = *(PVOID**) device5;
+        device5Fn = (PFN_CheckFeatureSupport) vt5[13];
+        LOG_INFO("D3D12 Device5 {:X} CheckFeatureSupport {:X} module '{}' distinct {}", (size_t) device5,
+                 (size_t) device5Fn, ModulePathForAddress((void*) device5Fn), device5Fn != deviceFn ? 1 : 0);
+        device5->Release();
+    }
+    else
+    {
+        LOG_WARN("D3D12 QueryInterface ID3D12Device5 failed");
+    }
+
+    const bool needDevice = deviceFn != nullptr && o_CheckFeatureSupport == nullptr;
+    const bool needDev5 = device5Fn != nullptr && device5Fn != deviceFn && o_CheckFeatureSupportDevice5 == nullptr &&
+                          device5Fn != o_CheckFeatureSupport;
+
+    if (!needDevice && !needDev5)
+        return;
+
+    DetourTransactionBegin();
+    DetourUpdateThread(GetCurrentThread());
+
+    if (needDevice)
+    {
+        o_CheckFeatureSupport = deviceFn;
+        DetourAttach(&(PVOID&) o_CheckFeatureSupport, hkCheckFeatureSupport);
+    }
+
+    if (needDev5)
+    {
+        o_CheckFeatureSupportDevice5 = device5Fn;
+        DetourAttach(&(PVOID&) o_CheckFeatureSupportDevice5, hkCheckFeatureSupportDevice5);
+    }
+
+    auto detourResult = DetourTransactionCommit();
+    if (detourResult != NO_ERROR)
+    {
+        LOG_ERROR("Failed to detour CheckFeatureSupport, error: {:X}", detourResult);
+        if (needDevice)
+            o_CheckFeatureSupport = nullptr;
+        if (needDev5)
+            o_CheckFeatureSupportDevice5 = nullptr;
+    }
+    else
+    {
+        LOG_INFO("CheckFeatureSupport detour installed device {} device5 {}", needDevice ? 1 : 0, needDev5 ? 1 : 0);
+    }
+}
+
 static void HookToDevice(ID3D12Device* InDevice)
 {
-    if (o_CreateSampler != nullptr || InDevice == nullptr)
+    if (InDevice == nullptr)
+        return;
+
+    // Install even when sampler hooks already exist. The first CreateDevice is a
+    // Streamline probe that is released immediately; a later device can have a
+    // different CheckFeatureSupport thunk.
+    HookCheckFeatureSupportOnDevice(InDevice);
+
+    if (o_CreateSampler != nullptr)
         return;
 
     LOG_DEBUG("Dx12");
@@ -2173,7 +2317,8 @@ static void HookToDevice(ID3D12Device* InDevice)
     // hudless
     o_D3D12DeviceRelease = (PFN_Release) pVTable[2];
     o_CreateSampler = (PFN_CreateSampler) pVTable[22];
-    o_CheckFeatureSupport = (PFN_CheckFeatureSupport) pVTable[13];
+    // o_CheckFeatureSupport is the trampoline from HookCheckFeatureSupportOnDevice.
+    // Do not overwrite it with the raw vtable slot.
     o_CreateRootSignature = (PFN_CreateRootSignature) pVTable[16];
     o_GetResourceAllocationInfo = (PFN_GetResourceAllocationInfo) pVTable[25];
     o_CreateCommittedResource = (PFN_CreateCommittedResource) pVTable[27];
@@ -2216,8 +2361,8 @@ static void HookToDevice(ID3D12Device* InDevice)
         {
             LOG_DEBUG("UE spoofing for Intel Atomics64 enabled, applying detours");
 
-            if (o_CheckFeatureSupport != nullptr)
-                DetourAttach(&(PVOID&) o_CheckFeatureSupport, hkCheckFeatureSupport);
+            // CheckFeatureSupport is attached in HookCheckFeatureSupportOnDevice
+            // for every device, not only when this spoof is enabled.
 
             if (o_CreateCommittedResource != nullptr)
                 DetourAttach(&(PVOID&) o_CreateCommittedResource, hkCreateCommittedResource);
@@ -2234,7 +2379,6 @@ static void HookToDevice(ID3D12Device* InDevice)
         {
             LOG_ERROR("Failed to detour ID3D12Device methods, error: {:X}", detourResult);
             o_CreateSampler = nullptr;
-            o_CheckFeatureSupport = nullptr;
             o_CreateRootSignature = nullptr;
             o_CreateCommittedResource = nullptr;
             o_CreatePlacedResource = nullptr;
@@ -2265,6 +2409,9 @@ static void UnhookDevice()
     if (o_CheckFeatureSupport != nullptr)
         DetourDetach(&(PVOID&) o_CheckFeatureSupport, hkCheckFeatureSupport);
 
+    if (o_CheckFeatureSupportDevice5 != nullptr)
+        DetourDetach(&(PVOID&) o_CheckFeatureSupportDevice5, hkCheckFeatureSupportDevice5);
+
     if (o_CreateCommittedResource != nullptr)
         DetourDetach(&(PVOID&) o_CreateCommittedResource, hkCreateCommittedResource);
 
@@ -2286,6 +2433,7 @@ static void UnhookDevice()
     {
         o_CreateSampler = nullptr;
         o_CheckFeatureSupport = nullptr;
+        o_CheckFeatureSupportDevice5 = nullptr;
         o_CreateCommittedResource = nullptr;
         o_CreatePlacedResource = nullptr;
         o_D3D12DeviceRelease = nullptr;
@@ -2351,6 +2499,9 @@ void D3D12Hooks::Unhook()
     if (o_CheckFeatureSupport != nullptr)
         DetourDetach(&(PVOID&) o_CheckFeatureSupport, hkCheckFeatureSupport);
 
+    if (o_CheckFeatureSupportDevice5 != nullptr)
+        DetourDetach(&(PVOID&) o_CheckFeatureSupportDevice5, hkCheckFeatureSupportDevice5);
+
     if (o_CreateCommittedResource != nullptr)
         DetourDetach(&(PVOID&) o_CreateCommittedResource, hkCreateCommittedResource);
 
@@ -2372,6 +2523,7 @@ void D3D12Hooks::Unhook()
     {
         o_CreateSampler = nullptr;
         o_CheckFeatureSupport = nullptr;
+        o_CheckFeatureSupportDevice5 = nullptr;
         o_CreateCommittedResource = nullptr;
         o_CreatePlacedResource = nullptr;
         o_D3D12DeviceRelease = nullptr;
